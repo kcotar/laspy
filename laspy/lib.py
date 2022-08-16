@@ -17,6 +17,7 @@ from .lasmmap import LasMMAP
 from .lasreader import LasReader
 from .laswriter import LasWriter
 from .point import dims, record, PointFormat
+from .vlrs.vlrlist import VLRList
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ def open_las(
     header=None,
     do_compress=None,
     encoding_errors: str = "strict",
+    header_only: bool = False,
 ) -> Union[LasReader, LasWriter, LasAppender]:
     """The laspy.open opens a LAS/LAZ file in one of the 3 supported
     mode:
@@ -82,7 +84,7 @@ def open_las(
 
     do_compress: optional, bool, only meaningful in writing mode:
         - None (default) guess if compression is needed using the file extension
-        or if a laz_backend was explicitely provided
+          or if a laz_backend was explicitely provided
         - True compresses the file
         - False do not compress the file
 
@@ -114,7 +116,7 @@ def open_las(
             stream = io.BytesIO(source)
         else:
             stream = source
-        return LasReader(stream, closefd=closefd, laz_backend=laz_backend)
+        return LasReader(stream, closefd=closefd, laz_backend=laz_backend, header_only=header_only)
     elif mode == "w":
         if header is None:
             raise ValueError("A header is needed when opening a file for writing")
@@ -319,7 +321,7 @@ def convert(source_las, *, point_format_id=None, file_version=None):
     header.set_version_and_point_format(version, point_format)
 
     if source_las.evlrs is not None:
-        evlrs = source_las.evlrs.copy()
+        evlrs = VLRList(source_las.evlrs.copy())
     else:
         evlrs = None
 

@@ -7,10 +7,12 @@ import logging
 from copy import deepcopy
 
 import numpy as np
+from enum import Enum, auto
 
 from . import dims
 from .dims import ScaledArrayView, OLD_LASPY_NAMES
 from ..point import PointFormat
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,19 @@ def scale_dimension(array_dim, scale, offset):
 
 def unscale_dimension(array_dim, scale, offset):
     return np.round((np.array(array_dim) - offset) / scale)
+
+
+class DimensionNameValidity(Enum):
+    """Helper class to make the return value of
+    PackedPointRecord.validate_dimentsion_name more expressive.
+    """
+
+    # Means the name is valid and supported by the point format
+    Valid = auto()
+    # Means the name is valid but _not_ supported by the point format
+    Unsupported = auto()
+    # The name does not exist in LAS spec
+    Invalid = auto()
 
 
 class PackedPointRecord:
@@ -42,9 +57,9 @@ class PackedPointRecord:
     """
 
     def __init__(self, data: np.ndarray, point_format: PointFormat):
-        self.array = data
-        self.point_format = point_format
-        self.sub_fields_dict = dims.get_sub_fields_dict(point_format.id)
+        self.__dict__["array"] = data
+        self.__dict__["point_format"] = point_format
+        self.__dict__["sub_fields_dict"] = dims.get_sub_fields_dict(point_format.id)
 
     @property
     def point_size(self):
@@ -139,9 +154,8 @@ class PackedPointRecord:
         """Appends zeros to the points stored if the value we are trying to
         fit is bigger
         """
-        size_diff = len(value) - len(self.array)
-        if size_diff > 0:
-            self.resize(size_diff)
+        if len(value) > len(self.array):
+            self.resize(len(value))
 
     def __eq__(self, other):
         return self.point_format == other.point_format and np.all(
@@ -215,6 +229,31 @@ class PackedPointRecord:
         except ValueError:
             raise AttributeError("{} is not a valid dimension".format(item)) from None
 
+    def validate_dimension_name(self, key: str) -> DimensionNameValidity:
+        """Given a name of a dimension this validates it."""
+        try:
+            key = OLD_LASPY_NAMES[key]
+        except KeyError:
+            pass
+
+        if key in self.point_format.dimension_names or key in self.array.dtype.names:
+            return DimensionNameValidity.Valid
+        elif key in dims.DIMENSIONS_TO_TYPE:
+            return DimensionNameValidity.Unsupported
+        else:
+            return DimensionNameValidity.Invalid
+
+    def __setattr__(self, key, value):
+        name_validity = self.validate_dimension_name(key)
+        if name_validity == DimensionNameValidity.Valid:
+            self[key] = value
+        elif name_validity == DimensionNameValidity.Unsupported:
+            raise ValueError(
+                f"Point format {self.point_format} does not support {key} dimension"
+            )
+        else:
+            super().__setattr__(key, value)
+
     def __repr__(self):
         return "<{}(fmt: {}, len: {}, point size: {})>".format(
             self.__class__.__name__,
@@ -247,7 +286,7 @@ class ScaleAwarePointRecord(PackedPointRecord):
             raise ValueError("scales must be an array of 3 elements")
 
         if self.offsets.shape != (3,):
-            raise ValueError("scales must be an array of 3 elements")
+            raise ValueError("offsets must be an array of 3 elements")
 
     @staticmethod
     def zeros(
@@ -310,10 +349,10 @@ class ScaleAwarePointRecord(PackedPointRecord):
 
     def change_scaling(self, scales=None, offsets=None) -> None:
         """See :meth:`.LasData.change_scaling`"""
-        if scales is not None:
-            self.scales = scales
-        if offsets is not None:
-            self.offsets = offsets
+        if scales is None:
+            scales = self.scales
+        if offsets is None:
+            offsets = self.offsets
 
         apply_new_scaling(self, scales, offsets)
 

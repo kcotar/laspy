@@ -139,8 +139,8 @@ class LasWriter:
             raise LaspyException("Incompatible point formats")
 
         if self.update_header:
-            self.header.update(points)
-        
+            self.header.grow(points)
+
         self.point_writer.write_points(points)
 
     def write_evlrs(self, evlrs: VLRList) -> None:
@@ -177,6 +177,11 @@ class LasWriter:
         if self.point_writer is not None:
             if not self.done:
                 self.point_writer.done()
+
+            if self.header.point_count == 0:
+                self.header.maxs = [0.0, 0.0, 0.0]
+                self.header.mins = [0.0, 0.0, 0.0]
+
             self.point_writer.write_updated_header(self.header, self.encoding_errors)
         if self.closefd:
             self.dest.close()

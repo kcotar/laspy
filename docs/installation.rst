@@ -35,8 +35,12 @@ still need to install a LAZ backend via ``pip``
 
 
 
-Optional dependencies for LAZ support
-=====================================
+Optional dependencies  / features
+=================================
+
+
+LAZ support
+___________
 
 laspy does not support LAZ (.laz) file by itself but can use one of several optional dependencies
 to support compressed LAZ files.
@@ -64,11 +68,33 @@ Both the laszip bindings and lazrs are available on pip.
 To install laspy with one of its supported backend use one of the following commands
 
 
+CRS / SRS
+_________
+
+LAS files allows to define the CRS / SRS in which the points coordinates are.
+When `pyproj` is installed, you can use the :meth:`.LasHeader.add_crs` to add 
+CRS information to a file, or you can use :meth:`.LasHeader.parse_crs` to get 
+`pyproj.CRS`.
+
+
 .. _lazrs: https://github.com/tmontaigu/laz-rs
 .. _laszip-python: https://github.com/tmontaigu/laszip-python
 .. _laszip: https://github.com/LASzip/LASzip
 .. _[lazrs PyPi]: https://pypi.org/project/lazrs/
 
+
+Cloud Optimized Point Cloud (COPC)
+__________________________________
+
+`laspy` supports `COPC`_ files via its :class:`.CopcReader` class.
+This features **requires** the optional dependency ``lazrs`` to be installed.
+
+Optionaly, when python package `requests`_ is installed the :class:`.CopcReader`
+can handle COPC that are in a HTTP server.
+
+
+.. _COPC: https://github.com/copcio/copcio.github.io
+.. _requests: https://docs.python-requests.org/en/latest
 
 
 .. rubric:: Footnotes.
