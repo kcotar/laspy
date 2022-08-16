@@ -7,7 +7,8 @@ import abc
 import ctypes
 import logging
 import struct
-from typing import List, Optional, Any, Tuple, Dict
+from typing import List, Optional, Any, Tuple, Dict, TypeVar, Type
+from copy import copy
 
 import numpy as np
 
@@ -23,6 +24,10 @@ abstractmethod = abc.abstractmethod
 logger = logging.getLogger(__name__)
 
 NULL_BYTE = b"\0"
+
+
+GeoKeyDirectoryType = TypeVar("GeoKeyDirectoryType", bound="GeoKeyDirectoryVlr")
+GeoAsciiParamsType = TypeVar("GeoAsciiParamsType", bound="GeoAsciiParamsVlr")
 
 
 class IKnownVLR(abc.ABC):
@@ -410,9 +415,27 @@ class WaveformPacketVlr(BaseKnownVLR):
 class GeoKeyEntryStruct(ctypes.LittleEndianStructure):
     _pack_ = 1
     _fields_ = [
+        # Id of the key
+        #
+        # Ids are broken down in sub domains:
+        # [    0,  1023]       Reserved
+        # [ 1024,  2047]       GeoTIFF Configuration Keys
+        # [ 2048,  3071]       Geographic/Geocentric CS Parameter Keys
+        # [ 3072,  4095]       Projected CS Parameter Keys
+        # [ 4096,  5119]       Vertical CS Parameter Keys
+        # [ 5120, 32767]       Reserved
+        # [32768, 65535]       Private use
         ("id", ctypes.c_uint16),
+        # Where to find the data for the key:
+        # 0 => The _actual_ value is stored directly in the "value_offset" member
+        # Otherwise, the tiff tag location is the record_id of the VLR in which the value is stored.
+        # In the case of LAS files the 2 possible values are `34736`, `34737`.
         ("tiff_tag_location", ctypes.c_uint16),
+        # Number of values in the key.
+        # Implied to be `1` if `tiff_tag_location` is 0
         ("count", ctypes.c_uint16),
+        # Depending on `tiff_tag_location`, this contains either
+        # the value itself _or_ the offset in the record_data of the containing VLR
         ("value_offset", ctypes.c_uint16),
     ]
 
@@ -429,7 +452,7 @@ class GeoKeyEntryStruct(ctypes.LittleEndianStructure):
 class GeoKeysHeaderStructs(ctypes.LittleEndianStructure):
     _pack_ = 1
     _fields_ = [
-        ("key_direction_version", ctypes.c_uint16),
+        ("key_directory_version", ctypes.c_uint16),
         ("key_revision", ctypes.c_uint16),
         ("minor_revision", ctypes.c_uint16),
         ("number_of_keys", ctypes.c_uint16),
@@ -437,7 +460,7 @@ class GeoKeysHeaderStructs(ctypes.LittleEndianStructure):
 
     def __init__(self):
         super().__init__(
-            key_directory_version=1, key_revision=1, minor_revision=0, number_of_kets=0
+            key_directory_version=1, key_revision=1, minor_revision=0, number_of_keys=0
         )
 
     @staticmethod
@@ -446,7 +469,7 @@ class GeoKeysHeaderStructs(ctypes.LittleEndianStructure):
 
     def __repr__(self):
         return "<GeoKeysHeader(vers: {}, rev:{}, minor: {}, num_keys: {})>".format(
-            self.key_direction_version,
+            self.key_directory_version,
             self.key_revision,
             self.minor_revision,
             self.number_of_keys,
@@ -482,6 +505,18 @@ class GeoKeyDirectoryVlr(BaseKnownVLR):
         b += b"".join(map(bytes, self.geo_keys))
         return b
 
+    def parse_crs(self):
+        import pyproj
+
+        # TODO import is done here to avoid cyclic import,
+        # this should probably be fixed
+        from .geotiff import ProjectedCSTypeGeoKey, GeographicTypeGeoKey
+
+        for key in self.geo_keys:
+            if key.id == ProjectedCSTypeGeoKey.id or key.id == GeographicTypeGeoKey.id:
+                return pyproj.CRS.from_epsg(key.value_offset)
+        return None
+
     def __repr__(self):
         return "<{}({} geo_keys)>".format(self.__class__.__name__, len(self.geo_keys))
 
@@ -495,6 +530,10 @@ class GeoKeyDirectoryVlr(BaseKnownVLR):
 
 
 class GeoDoubleParamsVlr(BaseKnownVLR):
+    """
+    Stores all of the `double` valued GeoKeys.
+    """
+
     def __init__(self):
         super().__init__(description="GeoTIFF GeoDoubleParamsTag")
         self.doubles = []
@@ -529,23 +568,18 @@ class GeoDoubleParamsVlr(BaseKnownVLR):
 
 
 class GeoAsciiParamsVlr(BaseKnownVLR):
+    """
+    Stores all of the `ASCII` valued GeoKeys.
+
+    From GeoTIFF's spec:
+    To avoid problems with naive tiff dump programs the separator between geokeys is not
+    the null-terminator `\0` but `|`.
+
+    """
+
     def __init__(self):
         super().__init__(description="GeoTIFF GeoAsciiParamsTag")
         self.strings = []
-
-    def string(self, global_offset, size):
-        # The string in the vlr were stored contiguously, and null-separated
-        # we parsed them into list of strings.
-        # In the geokeys vlr, the offset to a string, is an offset in the
-        # contiguous strings, to this function does the conversion to find the
-        # correct string in our storage
-        count = 0
-        for string in self.strings:
-            count += len(string) + 1  # Account for the null byte
-            if count >= global_offset:
-                local_offset = global_offset - (count - len(string) - 1)
-                return string[local_offset:size]
-        raise IndexError(f"Invalid index: {global_offset}")
 
     def parse_record_data(self, record_data):
         self.strings = [s.decode("ascii") for s in record_data.split(NULL_BYTE)]
@@ -613,6 +647,11 @@ class WktCoordinateSystemVlr(BaseKnownVLR):
 
     def record_data_bytes(self):
         return self._encode_string()
+
+    def parse_crs(self):
+        import pyproj
+
+        return pyproj.CRS.from_wkt(self.string)
 
     @staticmethod
     def official_user_id():

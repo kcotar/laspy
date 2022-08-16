@@ -4,7 +4,7 @@ import logging
 import struct
 import typing
 from datetime import date, timedelta
-from typing import NamedTuple, BinaryIO, Optional, List, Union
+from typing import NamedTuple, BinaryIO, Optional, List, Union, Iterable
 from uuid import UUID
 
 import numpy as np
@@ -21,7 +21,14 @@ from .point.format import PointFormat, ExtraBytesParams
 from .point.record import PackedPointRecord
 from .utils import read_string, write_as_c_string
 from .vlrs import VLR
-from .vlrs.known import ExtraBytesStruct, ExtraBytesVlr
+from .vlrs.geotiff import create_geotiff_projection_vlrs
+from .vlrs.known import (
+    ExtraBytesStruct,
+    ExtraBytesVlr,
+    WktCoordinateSystemVlr,
+    GeoKeyDirectoryVlr,
+    GeoAsciiParamsVlr,
+)
 from .vlrs.vlrlist import VLRList
 from . import __version__
 
@@ -399,6 +406,51 @@ class LasHeader:
     def add_extra_dim(self, params: ExtraBytesParams):
         self.add_extra_dims([params])
 
+    def add_crs(self, crs: "pyproj.CRS", keep_compatibility: bool = True) -> None:
+        """Add a Coordinate Reference System VLR from a pyproj CRS object.
+
+        The type of VLR created depends on the las version and point format
+        version. Las version >= 1.4 use WKT string, las version < 1.4 and point
+        format < 6 use GeoTiff tags.
+
+        .. warning::
+            This requires `pyproj`.
+
+        .. warning::
+            Not all CRS are supported when adding GeoTiff tags. For example, custom
+            CRS. Typically, if the CRS has an EPSG code it will be supported.
+        """
+        import pyproj
+
+        # check and remove any existing crs vlrs
+        for crs_vlr_name in (
+            "WktCoordinateSystemVlr",
+            "GeoKeyDirectoryVlr",
+            "GeoAsciiParamsVlr",
+            "GeoDoubleParamsVlr",
+        ):
+            try:
+                self._vlrs.extract(crs_vlr_name)
+            except IndexError:
+                pass
+
+        new_ver = self._version >= Version(1, 4)
+        new_pt = self.point_format.id >= 6
+
+        if new_pt or (new_ver and not keep_compatibility):
+            self._vlrs.append(WktCoordinateSystemVlr(crs.to_wkt()))
+            self.global_encoding.wkt = True
+        else:
+            self._vlrs.extend(create_geotiff_projection_vlrs(crs))
+
+    def remove_extra_dim(self, name: str) -> None:
+        self.remove_extra_dims([name])
+
+    def remove_extra_dims(self, names: Iterable[str]) -> None:
+        for name in names:
+            self.point_format.remove_extra_dimension(name)
+        self._sync_extra_bytes_vlr()
+
     def set_version_and_point_format(
         self, version: Version, point_format: PointFormat
     ) -> None:
@@ -408,16 +460,25 @@ class LasHeader:
 
     def partial_reset(self) -> None:
         self.creation_date = date.today()
-        self.point_count = 0
 
-        self.maxs = np.zeros(3, dtype=np.float64)
-        self.mins = np.zeros(3, dtype=np.float64)
-        self.number_of_points_by_return = np.zeros(15, dtype=np.uint32)
+        f64info = np.finfo(np.float64)
+        self.maxs = np.ones(3, dtype=np.float64) * f64info.min
+        self.mins = np.ones(3, dtype=np.float64) * f64info.max
 
         self.start_of_first_evlr = 0
         self.number_of_evlrs = 0
+        self.point_count = 0
+        self.number_of_points_by_return = np.zeros(15, dtype=np.uint32)
 
     def update(self, points: PackedPointRecord) -> None:
+        self.partial_reset()
+        if not points:
+            self.maxs = [0.0, 0.0, 0.0]
+            self.mins = [0.0, 0.0, 0.0]
+        else:
+            self.grow(points)
+
+    def grow(self, points: PackedPointRecord) -> None:
         self.x_max = max(
             self.x_max,
             (points["X"].max() * self.x_scale) + self.x_offset,
@@ -457,15 +518,15 @@ class LasHeader:
         self.are_points_compressed = state
 
     @classmethod
-    def read_from(cls, stream: BinaryIO, seekable=True) -> "LasHeader":
+    def read_from(cls, stream: BinaryIO) -> "LasHeader":
         little_endian = "little"
         header = cls()
 
-        file_sig = stream.read(len(LAS_FILE_SIGNATURE))
-        if not file_sig:
-            raise LaspyException(f"Source is empty")
-        if file_sig != LAS_FILE_SIGNATURE:
-            raise LaspyException(f'Invalid file signature "{file_sig}"')
+        stream = io.BytesIO(cls._prefetch_header_data(stream))
+
+        file_sig = stream.read(4)
+        # This should not be possible as _prefetch already checks this
+        assert file_sig == LAS_FILE_SIGNATURE
 
         header.file_source_id = int.from_bytes(
             stream.read(2), little_endian, signed=False
@@ -534,10 +595,7 @@ class LasHeader:
                     stream.read(8), little_endian, signed=False
                 )
 
-        if seekable:
-            current_pos = stream.tell()
-        else:
-            current_pos = LAS_HEADERS_SIZE[str(header.version)]
+        current_pos = stream.tell()
         if current_pos < header_size:
             header.extra_header_bytes = stream.read(header_size - current_pos)
         elif current_pos > header_size:
@@ -545,14 +603,13 @@ class LasHeader:
 
         header._vlrs = VLRList.read_from(stream, num_to_read=number_of_vlrs)
 
-        if seekable:
-            current_pos = stream.tell()
-            if current_pos < header.offset_to_point_data:
-                header.extra_vlr_bytes = stream.read(
-                    header.offset_to_point_data - current_pos
-                )
-            elif current_pos > header.offset_to_point_data:
-                raise LaspyException("Incoherent offset to point data")
+        current_pos = stream.tell()
+        if current_pos < header.offset_to_point_data:
+            header.extra_vlr_bytes = stream.read(
+                header.offset_to_point_data - current_pos
+            )
+        elif current_pos > header.offset_to_point_data:
+            raise LaspyException("Incoherent offset to point data")
 
         header.are_points_compressed = is_point_format_compressed(point_format_id)
         point_format_id = compressed_id_to_uncompressed(point_format_id)
@@ -725,6 +782,56 @@ class LasHeader:
         stream.write(self.extra_header_bytes)
         stream.write(vlr_bytes)
         stream.write(self.extra_vlr_bytes)
+
+    def parse_crs(self) -> Optional["pyproj.CRS"]:
+        """
+        Method to parse OGC WKT or GeoTiff VLR keys into a pyproj CRS object
+
+        .. warning::
+            This requires `pyproj`.
+        """
+
+        geo_vlr = self._vlrs.get_by_id("LASF_Projection")
+
+        for rec in geo_vlr:
+            if isinstance(rec, (WktCoordinateSystemVlr, GeoKeyDirectoryVlr)):
+                crs = rec.parse_crs()
+                if crs is not None:
+                    return crs
+
+        return None
+
+    @staticmethod
+    def _prefetch_header_data(source) -> bytes:
+        """
+        reads (and returns) from the source all the bytes that
+        are between the beginning of the file and the start of point data
+        (which corresponds to Header + VLRS).
+
+        It is done in two calls to the source's `read` method
+
+        This is done because `LasHeader.read_from`
+        does a bunch of read to the source, so we prefer to
+        prefetch data in memory in case the original source
+        is not buffered (like a http source could be)
+        """
+        header_bytes = source.read(LAS_HEADERS_SIZE["1.1"])
+
+        file_sig = header_bytes[: len(LAS_FILE_SIGNATURE)]
+        if not file_sig:
+            raise LaspyException(f"Source is empty")
+        if file_sig != LAS_FILE_SIGNATURE:
+            raise LaspyException(f'Invalid file signature "{file_sig}"')
+        if len(header_bytes) < LAS_HEADERS_SIZE["1.1"]:
+            raise LaspyException("File is to small to be a valid LAS")
+
+        offset_to_data = int.from_bytes(
+            header_bytes[96 : 96 + 4], byteorder="little", signed=False
+        )
+
+        rest = source.read(offset_to_data - len(header_bytes))
+
+        return header_bytes + rest
 
     def _sync_extra_bytes_vlr(self) -> None:
         try:

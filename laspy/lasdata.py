@@ -2,7 +2,7 @@ import logging
 import pathlib
 import typing
 from copy import deepcopy
-from typing import Union, Optional, List, Sequence, overload, BinaryIO
+from typing import Union, Optional, List, Sequence, overload, BinaryIO, Iterable
 
 import numpy as np
 
@@ -12,6 +12,7 @@ from .header import LasHeader
 from .laswriter import LasWriter
 from .point import record, dims, ExtraBytesParams, PointFormat
 from .point.dims import ScaledArrayView, SubFieldView, OLD_LASPY_NAMES
+from .point.record import DimensionNameValidity
 from .vlrs.vlrlist import VLRList
 
 logger = logging.getLogger(__name__)
@@ -138,10 +139,67 @@ class LasData:
         params: list of parameters of the new extra dimensions to add
         """
         self.header.add_extra_dims(params)
-        new_point_record = record.PackedPointRecord.from_point_record(
-            self.points, self.header.point_format
+        new_point_record = record.ScaleAwarePointRecord.zeros(
+            len(self.points), header=self.header
         )
+        new_point_record.copy_fields_from(self.points)
         self.points = new_point_record
+
+    def remove_extra_dims(self, names: Iterable[str]) -> None:
+        """Remove multiple extra dimensions from this object
+
+        Parameters
+        ----------
+
+        names: iterable,
+            names of the extra dimensions to be removed
+
+
+        Raises
+        ------
+
+        LaspyException: if you try to remove an extra dimension that do not exist.
+
+        """
+        extra_dimension_names = list(self.point_format.extra_dimension_names)
+        not_extra_dimension = [
+            name for name in names if name not in extra_dimension_names
+        ]
+        if not_extra_dimension:
+            raise errors.LaspyException(
+                f"'{not_extra_dimension}' are not extra dimensions and cannot be removed"
+            )
+
+        self.header.remove_extra_dims(names)
+        new_point_record = record.ScaleAwarePointRecord.zeros(
+            len(self.points), header=self.header
+        )
+        new_point_record.copy_fields_from(self.points)
+        self.points = new_point_record
+
+    def remove_extra_dim(self, name: str) -> None:
+        """Remove an extra dimensions from this object
+
+        .. note::
+
+             If you plan on removing multiple extra dimensions,
+             prefer :meth:`.remove_extra_dims` as it will
+             save re-allocations and data copy
+
+        Parameters
+        ----------
+
+        name: str,
+            name of the extra dimension to be removed
+
+
+        Raises
+        ------
+
+        LaspyException: if you try to remove an extra dimension that do not exist.
+
+        """
+        self.remove_extra_dims([name])
 
     def update_header(self) -> None:
         """Update the information stored in the header
@@ -150,12 +208,9 @@ class LasData:
         This method is called automatically when you save a file using
         :meth:`laspy.lasdatas.base.LasBase.write`
         """
-        self.header.partial_reset()
+        self.header.update(self.points)
         self.header.point_format_id = self.points.point_format.id
         self.header.point_data_record_length = self.points.point_size
-
-        if len(self.points) > 0:
-            self.header.update(self.points)
 
         if self.header.version.minor >= 4:
             if self.evlrs is not None:
@@ -249,11 +304,53 @@ class LasData:
                 New scales to be used. If not provided, the scales won't change.
         offsets: optional
                  New offsets to be used. If not provided, the offsets won't change.
+
+        Example
+        -------
+
+        >>> import laspy
+        >>> header = laspy.LasHeader()
+        >>> header.scales = np.array([0.1, 0.1, 0.1])
+        >>> header.offsets = np.array([0, 0 ,0])
+
+        >>> las = laspy.LasData(header=header)
+        >>> las.x = [10.0]
+        >>> las.y = [20.0]
+        >>> las.z = [30.0]
+
+        >>> # X = (x - x_offset) / x_scale
+        >>> assert np.all(las.xyz == [[10.0, 20., 30]])
+        >>> assert np.all(las.X == [100])
+        >>> assert np.all(las.Y == [200])
+        >>> assert np.all(las.Z == [300])
+
+        We change the scales (only changing x_scale here)
+        but not the offsets.
+
+        The xyz coordinates (double) are the same (minus possible rounding with actual coordinates)
+        However the integer coordinates changed
+
+        >>> las.change_scaling(scales=[0.01, 0.1, 0.1])
+        >>> assert np.all(las.xyz == [[10.0, 20., 30]])
+        >>> assert np.all(las.X == [1000])
+        >>> assert np.all(las.Y == [200])
+        >>> assert np.all(las.Z == [300])
+
+        Same idea if we change the offsets, the xyz do not change
+        but XYZ does
+
+        >>> las.change_scaling(offsets=[0, 10, 15])
+        >>> assert np.all(las.xyz == [[10.0, 20., 30]])
+        >>> assert np.all(las.X == [1000])
+        >>> assert np.all(las.Y == [100])
+        >>> assert np.all(las.Z == [150])
         """
         self.points.change_scaling(scales, offsets)
 
-        self.header.scales = scales
-        self.header.offsets = offsets
+        if scales is not None:
+            self.header.scales = scales
+        if offsets is not None:
+            self.header.offsets = offsets
 
     def __getattr__(self, item):
         """Automatically called by Python when the attribute
@@ -288,18 +385,19 @@ class LasData:
         eg: user tries to set the red field of a file with point format 0:
         an error is raised
         """
-
-        try:
-            key = OLD_LASPY_NAMES[key]
-        except KeyError:
-            pass
-
-        if (
-            key in self.point_format.dimension_names
-            or key in self.points.array.dtype.names
-        ):
+        if key in ("x", "y", "z"):
+            # It is possible that user created a `LasData` object
+            # via `laspy.create`, and changed the headers offsets and scales
+            # values afterwards. So we need to sync the points's record.
+            self.points.offsets = self.header.offsets
+            self.points.scales = self.header.scales
             self.points[key] = value
-        elif key in dims.DIMENSIONS_TO_TYPE:
+            return
+
+        name_validity = self.points.validate_dimension_name(key)
+        if name_validity == DimensionNameValidity.Valid:
+            self[key] = value
+        elif name_validity == DimensionNameValidity.Unsupported:
             raise ValueError(
                 f"Point format {self.point_format} does not support {key} dimension"
             )

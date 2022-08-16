@@ -14,6 +14,7 @@ test1_4_las = conftest.TEST1_4_LAS_FILE_PATH
 extra_bytes_las = conftest.EXTRA_BYTES_LAS_FILE_PATH
 extra_bytes_laz = conftest.EXTRA_BYTES_LAZ_FILE_PATH
 plane_laz = conftest.PLANE_LAZ_FILE_PATH
+autzen_las = conftest.AUTZEN_FILE_PATH
 
 if not laspy.LazBackend.detect_available():
     do_compression = [False]
@@ -283,3 +284,117 @@ def test_las_data_getitem_slice():
     # https://numpy.org/doc/stable/reference/arrays.indexing.html
     assert np.all(las.classification[:10] == 1)
     assert np.all(las.classification[10:] == 0)
+
+
+def test_change_scaling():
+    """ Check our change scaling method.
+
+    We expect the scaled x,y,z not to change
+    while the unscaled (integers) X,Y,Z should change.
+    """
+    hdr = laspy.LasHeader()
+    hdr.offsets = np.array([0.0, 0.0, 0.0])
+    hdr.scales = np.array([1.0, 1.0, 1.0])
+
+    las = laspy.LasData(hdr)
+
+    las['x'] = np.array([1, 2, 3, 4])
+    las['y'] = np.array([1, 2, 3, 4])
+    las['z'] = np.array([1, 2, 3, 4])
+
+    assert np.all(las.x == [1, 2, 3, 4])
+    assert np.all(las.y == [1, 2, 3, 4])
+    assert np.all(las.z == [1, 2, 3, 4])
+
+    assert np.all(las.X == [1, 2, 3, 4])
+    assert np.all(las.Y == [1, 2, 3, 4])
+    assert np.all(las.Z == [1, 2, 3, 4])
+
+    saved_offsets = las.header.offsets.copy()
+    las.change_scaling(scales=[0.5, 0.1, 0.01])
+
+    assert np.all(las.header.scales == [0.5, 0.1, 0.01])
+    assert np.all(las.header.offsets == saved_offsets)
+
+    assert np.all(las.x == [1, 2, 3, 4])
+    assert np.all(las.y == [1, 2, 3, 4])
+    assert np.all(las.z == [1, 2, 3, 4])
+
+    assert np.all(las.X == [2, 4, 6, 8])
+    assert np.all(las.Y == [10, 20, 30, 40])
+    assert np.all(las.Z == [100, 200, 300, 400])
+
+    saved_scales = las.header.scales.copy()
+    las.change_scaling(offsets=[1, 20, 30])
+
+    assert np.all(las.header.scales == saved_scales)
+    assert np.all(las.header.offsets == [1, 20, 30])
+
+    assert np.all(las.x == [1, 2, 3, 4])
+    assert np.all(las.y == [1, 2, 3, 4])
+    assert np.all(las.z == [1, 2, 3, 4])
+
+    assert np.all(las.X == [0, 2, 4, 6])
+    assert np.all(las.Y == [-190, -180, -170, -160])
+    assert np.all(las.Z == [-2900, -2800, -2700, -2600])
+
+
+def test_setting_x_y_z_on_las_data():
+    """
+    The goal of this test if to make sure that when setting the `x`,`y` and `z`
+    attribute of a LasData object, the X,Y,Z version of the coordinates
+    are properly set in the inner point record
+    """
+    las = laspy.read(simple_las)
+
+    new_las = laspy.create()
+
+    new_las.x = las.x
+    new_las.y = las.y
+    new_las.z = las.z
+
+    assert np.all(new_las.x == las.x)
+    assert np.all(new_las.X == las.X)
+    assert np.all(new_las.y == las.y)
+    assert np.all(new_las.Y == las.Y)
+    assert np.all(new_las.z == las.z)
+    assert np.all(new_las.Z == las.Z)
+
+
+    new_las = laspy.lib.write_then_read_again(new_las)
+
+    assert np.all(new_las.x == las.x)
+    assert np.all(new_las.X == las.X)
+    assert np.all(new_las.y == las.y)
+    assert np.all(new_las.Y == las.Y)
+    assert np.all(new_las.z == las.z)
+    assert np.all(new_las.Z == las.Z)
+
+
+def test_setting_xyz_on_las_data():
+    """
+    The goal of this test if to make sure that when setting the `xyz`
+    attribute of a LasData object, the X,Y,Z version of the coordinates
+    are properly set in the inner point record
+    """
+    las = laspy.read(simple_las)
+
+    new_las = laspy.create()
+
+    new_las.xyz = las.xyz
+
+    assert np.all(new_las.x == las.x)
+    assert np.all(new_las.X == las.X)
+    assert np.all(new_las.y == las.y)
+    assert np.all(new_las.Y == las.Y)
+    assert np.all(new_las.z == las.z)
+    assert np.all(new_las.Z == las.Z)
+
+    new_las = laspy.lib.write_then_read_again(new_las)
+
+    assert np.all(new_las.x == las.x)
+    assert np.all(new_las.X == las.X)
+    assert np.all(new_las.y == las.y)
+    assert np.all(new_las.Y == las.Y)
+    assert np.all(new_las.z == las.z)
+    assert np.all(new_las.Z == las.Z)

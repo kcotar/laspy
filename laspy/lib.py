@@ -17,6 +17,7 @@ from .lasmmap import LasMMAP
 from .lasreader import LasReader
 from .laswriter import LasWriter
 from .point import dims, record, PointFormat
+from .vlrs.vlrlist import VLRList
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def open_las(
 
     do_compress: optional, bool, only meaningful in writing mode:
         - None (default) guess if compression is needed using the file extension
-        or if a laz_backend was explicitely provided
+          or if a laz_backend was explicitely provided
         - True compresses the file
         - False do not compress the file
 
@@ -319,7 +320,7 @@ def convert(source_las, *, point_format_id=None, file_version=None):
     header.set_version_and_point_format(version, point_format)
 
     if source_las.evlrs is not None:
-        evlrs = source_las.evlrs.copy()
+        evlrs = VLRList(source_las.evlrs.copy())
     else:
         evlrs = None
 

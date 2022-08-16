@@ -21,6 +21,7 @@ setup(
     long_description=readme,
     long_description_content_type="text/markdown",
     packages=find_packages(exclude=("tests",)),
+    python_requires=">=3.7",
     install_requires=["numpy"],
     extras_require={
         "dev": [
@@ -28,12 +29,13 @@ setup(
             "sphinx",
             "sphinx-rtd-theme",
             "nox",
-            "black==20.8b1",
+            "black==22.3.0",
             "pytest-benchmark",
             "m2r2",
         ],
-        "lazrs": ["lazrs>=0.4.0, < 0.5.0"],
+        "lazrs": ["lazrs>=0.4.3, < 0.5.0"],
         "laszip": ["laszip >= 0.1.0, < 0.2.0"],
+        "pyproj": ["pyproj"],
     },
     include_package_data=True,
     zip_safe=False,
