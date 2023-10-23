@@ -5,7 +5,7 @@ import pytest
 
 import laspy
 from laspy import PointFormat
-from tests.test_common import write_then_read_again, simple_las, test1_4_las
+from tests.test_common import simple_las, test1_4_las, write_then_read_again
 
 
 @pytest.fixture()
@@ -152,8 +152,9 @@ def test_writing_empty_file(laz_backend):
         else:
             las.write(out, laz_backend=laz_backend)
 
+
 def test_changing_scales_offset_after_create():
-    las = laspy.create(point_format=8, file_version='1.4')
+    las = laspy.create(point_format=8, file_version="1.4")
 
     las.header.x_scale = 0.0001
     las.header.y_scale = 0.0001

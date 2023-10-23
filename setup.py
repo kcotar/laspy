@@ -1,4 +1,4 @@
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 
 with open("README.md") as f:
     readme = f.read()
@@ -21,21 +21,29 @@ setup(
     long_description=readme,
     long_description_content_type="text/markdown",
     packages=find_packages(exclude=("tests",)),
-    python_requires=">=3.7",
+    python_requires=">=3.8",
     install_requires=["numpy"],
     extras_require={
         "dev": [
             "pytest",
+            "coverage",
             "sphinx",
             "sphinx-rtd-theme",
             "nox",
             "black==22.3.0",
             "pytest-benchmark",
             "m2r2",
+            "rangehttpserver",
+            "isort==5.11.5",
         ],
-        "lazrs": ["lazrs>=0.4.3, < 0.5.0"],
-        "laszip": ["laszip >= 0.1.0, < 0.2.0"],
+        "lazrs": ["lazrs>=0.5.0, < 0.6.0"],
+        "laszip": ["laszip >= 0.2.1, < 0.3.0"],
         "pyproj": ["pyproj"],
+        "requests": ["requests"],
+        "cli": ["typer[all] >= 0.8.0 "],
+    },
+    entry_points={
+        "console_scripts": ["laspy=laspy.cli.main:main"],
     },
     include_package_data=True,
     zip_safe=False,

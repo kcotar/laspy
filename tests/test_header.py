@@ -1,8 +1,9 @@
+import copy
 import io
 from datetime import date
 
-import pytest
 import numpy as np
+import pytest
 
 import laspy
 from laspy import LasHeader
@@ -52,8 +53,6 @@ def test_nb_points_return_1_4():
 
 
 def test_header_copy():
-    import copy
-
     las = laspy.read(test_common.simple_las)
     header_copy = copy.copy(las.header)
 
@@ -181,24 +180,24 @@ def test_extra_vlr_bytes():
 
 
 def test_header_update_after_slicing():
-    """ Test that after slicing a LasData and after its header was
+    """Test that after slicing a LasData and after its header was
     updated, its header's bound correctly reflect the new points.
     """
     las = laspy.read(test_common.simple_las)
 
     def dim_min_max_from_header(header, dim_name):
-        if dim_name == 'x':
+        if dim_name == "x":
             return header.x_min, header.x_max
 
-        if dim_name == 'y':
+        if dim_name == "y":
             return header.y_min, header.y_max
 
-        if dim_name == 'z':
+        if dim_name == "z":
             return header.z_min, header.z_max
 
         raise RuntimeError(f"Bad dim name {dim_name}")
 
-    for dim in ('x', 'y', 'z'):
+    for dim in ("x", "y", "z"):
         values = las[dim]
 
         old_min, old_max = dim_min_max_from_header(las.header, dim)
@@ -212,20 +211,26 @@ def test_header_update_after_slicing():
         values = las[dim]
 
         new_header_min, new_header_max = dim_min_max_from_header(las.header, dim)
-        assert new_header_max == values.max(), "Header max value does not correspond to actual max value"
-        assert new_header_min == values.min(), "Header min value does not correspond to actual min value"
+        assert (
+            new_header_max == values.max()
+        ), "Header max value does not correspond to actual max value"
+        assert (
+            new_header_min == values.min()
+        ), "Header min value does not correspond to actual min value"
         assert new_header_min > old_min
         assert new_header_max < old_max
 
 
 def test_header_update_setting_points_on_new_las():
-    """ Internally, when updating the header, its mins and maxs will temporarily be set
+    """Internally, when updating the header, its mins and maxs will temporarily be set
     to f64::max_value and f64::min_value. This test is to make sure those value are
     truly temporary. Even when setting the points to an empty record
     """
     las = laspy.read(test_common.simple_las)
 
-    new_las = laspy.create(point_format=las.header.point_format, file_version=las.header.version)
+    new_las = laspy.create(
+        point_format=las.header.point_format, file_version=las.header.version
+    )
     assert np.all(new_las.header.mins == [0.0, 0.0, 0.0])
     assert np.all(new_las.header.maxs == [0.0, 0.0, 0.0])
     assert np.sum(new_las.header.number_of_points_by_return) == 0
@@ -238,18 +243,77 @@ def test_header_update_setting_points_on_new_las():
     new_las.points = las.points.copy()
     assert np.all(new_las.header.mins == las.header.mins)
     assert np.all(new_las.header.maxs == las.header.maxs)
-    assert np.all(new_las.header.number_of_points_by_return == las.header.number_of_points_by_return)
+    assert np.all(
+        new_las.header.number_of_points_by_return
+        == las.header.number_of_points_by_return
+    )
+
+
+def test_writing_does_not_reset_customly_set_data():
+    """If the user does set a data in a LasHeader,
+    the writer should not change it to date.today
+    """
+
+    DATE = date(year=1990, month=11, day=21)
+
+    las = laspy.read(test_common.simple_las)
+    assert las.header.creation_date != DATE
+
+    new_header = laspy.LasHeader(
+        version=las.header.version, point_format=las.header.point_format
+    )
+
+    assert new_header.creation_date == date.today()
+    new_header.creation_date = DATE
+    assert new_header.creation_date == DATE
+
+    new_las = laspy.LasData(header=new_header, points=las.points)
+    read_new_las = write_then_read_again(new_las)
+    assert read_new_las.header.date == DATE
+    assert new_las.header.date == DATE
+
+
+def test_not_setting_date_in_new_header_resets_to_date_today():
+    las = laspy.read(test_common.simple_las)
+
+    new_header = laspy.LasHeader(
+        version=las.header.version, point_format=las.header.point_format
+    )
+    assert new_header.creation_date == date.today()
+
+    new_las = laspy.LasData(header=new_header, points=las.points)
+    read_new_las = write_then_read_again(new_las)
+    assert read_new_las.header.date == date.today()
+    assert new_header.creation_date == date.today()
+
+
+def test_writing_when_creation_date_is_None():
+    las = laspy.read(test_common.simple_las)
+
+    new_header = laspy.LasHeader(
+        version=las.header.version, point_format=las.header.point_format
+    )
+    assert new_header.creation_date == date.today()
+    new_header.creation_date = None
+    assert new_header.creation_date is None
+
+    new_las = laspy.LasData(header=new_header, points=las.points)
+    read_new_las = write_then_read_again(new_las)
+    assert read_new_las.header.creation_date == date.today()
+    assert new_header.creation_date is None
+
 
 def test_header_min_max_chunk_mode():
-    """ Test that when writing a file using 'chunk mode' the header`s bounds are correct
-    """
+    """Test that when writing a file using 'chunk mode' the header`s bounds are correct"""
     las = laspy.read(test_common.simple_las)
-    header = laspy.LasHeader(point_format=las.header.point_format, version=las.header.version)
+    header = laspy.LasHeader(
+        point_format=las.header.point_format, version=las.header.version
+    )
     with io.BytesIO() as stream:
         with laspy.open(stream, mode="w", header=header, closefd=False) as writer:
             # We intenionally write the file in two write_points call
-            writer.write_points(las.points[:len(las.points) // 2])
-            writer.write_points(las.points[len(las.points) // 2:])
+            writer.write_points(las.points[: len(las.points) // 2])
+            writer.write_points(las.points[len(las.points) // 2 :])
 
         stream.seek(0)
         new_las = laspy.read(stream)
@@ -258,7 +322,7 @@ def test_header_min_max_chunk_mode():
 
 
 def test_update_header_empty_las_data():
-    """ Test updating the header on and empyt las, and writing
+    """Test updating the header on and empyt las, and writing
     an empyt las produces correct bounds values in header
 
     """

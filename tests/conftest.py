@@ -14,9 +14,12 @@ SIMPLE_LAZ_FILE_PATH = Path(__file__).parent / "data" / "simple.laz"
 EXTRA_BYTES_LAZ_FILE_PATH = Path(__file__).parent / "data" / "extra.laz"
 PLANE_LAZ_FILE_PATH = Path(__file__).parent / "data" / "plane.laz"
 AUTZEN_FILE_PATH = Path(__file__).parent / "data" / "autzen.las"
+AUTZEN_GEO_PROJ_FILE_PATH = Path(__file__).parent / "data" / "autzen_geo_proj.las"
 LAZ_1_4_WITH_EVLRS_FILE_PATH = Path(__file__).parent / "data" / "1_4_w_evlr.laz"
 
-UNREGISTERED_EXTRA_BYTES_LAS = Path(__file__).parent / "data" / "unregistered_extra_bytes.las"
+UNREGISTERED_EXTRA_BYTES_LAS = (
+    Path(__file__).parent / "data" / "unregistered_extra_bytes.las"
+)
 
 ALL_LAS_FILE_PATH = [
     SIMPLE_LAS_FILE_PATH,
@@ -71,6 +74,25 @@ SUPPORTED_EXTRA_BYTES_TYPE = (
 )
 
 
+class NonSeekableStream:
+    """
+    Fake non stream / file object which simulates a file object
+    on which we cannot seek
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def read(self, n):
+        return self.inner.read(n)
+
+    def seekable(self):
+        return False
+
+    def close(self):
+        pass
+
+
 @pytest.fixture()
 def simple_las_path():
     return SIMPLE_LAS_FILE_PATH
@@ -105,7 +127,7 @@ def laz_file_path(request):
 
 @pytest.fixture(params=ALL_LAS_FILE_PATH + ALL_LAZ_FILE_PATH, ids=repr)
 def file_path(request):
-    if len(laspy.LazBackend.detect_available()) == 0:
+    if request.param.suffix == ".laz" and len(laspy.LazBackend.detect_available()) == 0:
         return pytest.skip("No Laz Backend")
     return request.param
 
@@ -117,10 +139,6 @@ def file_path(request):
 )
 def laz_backend(request):
     return request.param
-
-
-def all_las_file_path():
-    return all_las_file_path()
 
 
 @pytest.fixture()

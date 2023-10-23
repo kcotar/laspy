@@ -1,13 +1,14 @@
 import io
 import multiprocessing
+import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
-from math import ceil, log2
 from dataclasses import dataclass
+from math import ceil, log2
 from operator import attrgetter
 from queue import Queue, SimpleQueue
 from threading import Thread
-from typing import List, Union, Dict, Optional, Tuple, Iterator
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 
 try:
     import requests
@@ -25,8 +26,9 @@ except ModuleNotFoundError:
 
 import numpy as np
 
+from .compression import DecompressionSelection
 from .errors import LaspyException, LazError
-from .header import LasHeader, LAS_HEADERS_SIZE
+from .header import LasHeader
 from .point.record import PackedPointRecord, ScaleAwarePointRecord
 from .vlrs.known import BaseKnownVLR
 
@@ -277,7 +279,7 @@ class Entry:
         return entry
 
     def __repr__(self) -> str:
-        return f"Entry(key={self.key}, offset={self.offset}, byte_size={self.byte_size}, point_count={self.point_count}"
+        return f"Entry(key={self.key}, offset={self.offset}, byte_size={self.byte_size}, point_count={self.point_count})"
 
 
 class HierarchyPage:
@@ -308,6 +310,7 @@ class CopcHierarchyVlr(BaseKnownVLR):
     """
 
     def __init__(self) -> None:
+        super().__init__()
         self.data: bytes = b""
         self.root_page = HierarchyPage()
 
@@ -402,6 +405,7 @@ def load_octree_for_query(
             page = HierarchyPage.from_bytes(page_bytes)
             hierarchy_page.entries.update(page.entries)
             nodes_to_load.insert(0, current_node)
+            continue
         elif entry.point_count != 0:
             current_node.offset = entry.offset
             current_node.byte_size = entry.byte_size
@@ -467,7 +471,7 @@ def http_queue_strategy(
     for query in byte_queries:
         query_queue.put(query)
 
-    for _ in range(num_threads):
+    for _ in range(min(len(byte_queries), num_threads)):
         HttpFetcherThread(source.url, query_queue, result_queue).start()
 
     query_queue.join()
@@ -547,6 +551,8 @@ class CopcReader:
     want to use the :meth:`.CopcReader.open` constructor
 
 
+    .. versionadded:: 2.2
+
     .. _COPC: https://github.com/copcio/copcio.github.io
     """
 
@@ -556,6 +562,7 @@ class CopcReader:
         close_fd: bool = True,
         http_num_threads: int = DEFAULT_HTTP_WORKERS_NUM,
         _http_strategy: str = "queue",
+        decompression_selection: DecompressionSelection = DecompressionSelection.all(),
     ):
         """
         Creates a CopcReader.
@@ -571,11 +578,17 @@ class CopcReader:
             Number of worker threads to do concurent HTTP requests,
             ignored when reading non-HTTP file
 
-
         close_fd: optional, default bool
             Whether the stream/file object shall be closed, this only work
             when using the CopcReader in a with statement.
 
+        decompression_selection: DecompressionSelection,
+            see :func:`laspy.open`
+
+
+
+        .. versionadded:: 2.4
+            The ``decompression_selection`` parameter.
         """
         if lazrs is None:
             raise LazError("COPC support requires the 'lazrs' backend")
@@ -583,6 +596,9 @@ class CopcReader:
         self.close_fd = close_fd
         self.http_num_threads = http_num_threads
         self.http_strategy = _http_strategy
+        self.decompression_selection: lazrs.DecompressionSelection = (
+            decompression_selection.to_lazrs()
+        )
 
         self.header = LasHeader.read_from(self.source)
 
@@ -627,9 +643,10 @@ class CopcReader:
     @classmethod
     def open(
         cls,
-        uri: str,
+        source: Union[str, os.PathLike, io.IOBase],
         http_num_threads: int = DEFAULT_HTTP_WORKERS_NUM,
         _http_strategy: str = "queue",
+        decompression_selection: DecompressionSelection = DecompressionSelection.all(),
     ) -> "CopcReader":
         """
         Opens the COPC file.
@@ -637,16 +654,20 @@ class CopcReader:
 
         Parameters
         ----------
-        uri: str, uri of the COPC file.
-            Supported uri are:
+        source: str, io.IOBase, uri or file-like object of the COPC file.
+            Supported sources are:
 
                 - 'local' files accesible with a path.
                 - HTTP / HTTPS endpoints. The pyhon package ``requests`` is
                   required in order to be able to work with HTTP endpoints.
+                - file-like objects, e.g. fsspec io.IOBase objects.
 
         http_num_threads: int, optional, default num cpu * 5
             Number of worker threads to do concurent HTTP requests,
             ignored when reading non-HTTP file
+
+        decompression_selection: DecompressionSelection,
+            see :func:`laspy.open`
 
 
         Opening a local file
@@ -669,13 +690,23 @@ class CopcReader:
             with CopcReader.open(url) as reader:
                 ...
 
-        """
-        if uri.startswith("http"):
-            source = HttpRangeStream(uri)
-        else:
-            source = open(uri, mode="rb")
 
-        return cls(source, http_num_threads=http_num_threads)
+
+        .. versionadded:: 2.4
+            The ``decompression_selection`` parameter.
+        """
+        if isinstance(source, (str, os.PathLike)):
+            source = str(source)
+            if source.startswith("http"):
+                source = HttpRangeStream(source)
+            else:
+                source = open(source, mode="rb")
+
+        return cls(
+            source,
+            http_num_threads=http_num_threads,
+            decompression_selection=decompression_selection,
+        )
 
     def query(
         self,
@@ -694,7 +725,7 @@ class CopcReader:
                 If None, the whole file's bounds will be considered
                 2D bounds are suported, (No point will be filtered on its Z coordinate)
 
-        resolution: float or int, optional, defailt None
+        resolution: float or int, optional, default None
                 Limits the octree levels to be queried in order to have
                 a point cloud with the requested resolution.
 
@@ -709,7 +740,7 @@ class CopcReader:
                The level of detail (LOD).
 
                - If None, all LOD are going to be considered
-               - If it is an int, only points that that are of the requested LOD
+               - If it is an int, only points that are of the requested LOD
                  will be returned.
                - If it is a range, points for which the LOD is within the range
                  will be returned
@@ -727,7 +758,6 @@ class CopcReader:
         if bounds is not None:
             bounds = bounds.ensure_3d(self.header.mins, self.header.maxs)
 
-        # nodes = query_octree_nodes(self.root, query_bounds=bounds, level_range=level)
         nodes = load_octree_for_query(
             self.source,
             self.copc_info,
@@ -797,7 +827,11 @@ class CopcReader:
         )
 
         lazrs.decompress_points_with_chunk_table(
-            compressed_bytes, self.laszip_vlr.record_data, points_array, chunk_table
+            compressed_bytes,
+            self.laszip_vlr.record_data,
+            points_array,
+            chunk_table,
+            self.decompression_selection,
         )
         r = PackedPointRecord.from_buffer(points_array, self.header.point_format)
         points = ScaleAwarePointRecord(

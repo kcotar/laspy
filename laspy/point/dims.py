@@ -8,25 +8,25 @@ import operator
 from collections import UserDict
 from enum import Enum
 from typing import (
+    Any,
+    Dict,
+    Generic,
+    Iterable,
+    List,
+    Mapping,
     NamedTuple,
     Optional,
-    Dict,
-    Tuple,
     Set,
-    Iterable,
-    Mapping,
-    TypeVar,
-    Generic,
-    List,
-    Union,
-    Any,
+    Tuple,
     Type,
+    TypeVar,
+    Union,
 )
 
 import numpy as np
 
-from . import packing
 from .. import errors
+from . import packing
 
 ValueType = TypeVar("ValueType")
 
@@ -120,7 +120,7 @@ DIMENSIONS_TO_TYPE: Dict[str, np.dtype] = {
     "wavepacket_index": np.dtype("u1"),
     "wavepacket_offset": np.dtype("u8"),
     "wavepacket_size": np.dtype("u4"),
-    "return_point_wave_location": np.dtype("u4"),
+    "return_point_wave_location": np.dtype("f4"),
     "x_t": np.dtype("f4"),
     "y_t": np.dtype("f4"),
     "z_t": np.dtype("f4"),
@@ -646,7 +646,7 @@ class SubFieldView(ArrayView):
     def _do_comparison(self, value, comp):
         if isinstance(value, (int, type(self.array.dtype))):
             if value > self.max_value_allowed:
-                return np.zeros_like(self.array, np.bool)
+                return np.zeros_like(self.array, bool)
         return comp(self.array & self.bit_mask, value << self.lsb)
 
     def __array__(self, *args, **kwargs):

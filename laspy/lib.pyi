@@ -1,7 +1,7 @@
-from typing import Union, BinaryIO, Iterable, Optional, overload, Literal
+from typing import BinaryIO, Iterable, Literal, Optional, Union, overload
 
 from . import LasWriter, PointFormat
-from .compression import LazBackend
+from .compression import DecompressionSelection, LazBackend
 from .header import LasHeader
 from .lasappender import LasAppender
 from .lasdata import LasData
@@ -10,6 +10,7 @@ from .lasreader import LasReader
 from .typehints import PathLike
 
 LazBackend = LazBackend
+DecompressionSelection = DecompressionSelection
 
 @overload
 def open_las(
@@ -60,6 +61,7 @@ def read_las(
     laz_backend: Union[
         LazBackend, Iterable[LazBackend]
     ] = LazBackend.detect_available(),
+    decompression_selection: DecompressionSelection = DecompressionSelection.all(),
 ) -> LasData: ...
 def mmap_las(filename: PathLike) -> LasMMAP: ...
 def merge_las(las_files: Union[Iterable[LasData], LasData]) -> LasData: ...
