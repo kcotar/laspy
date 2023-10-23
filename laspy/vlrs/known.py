@@ -7,17 +7,15 @@ import abc
 import ctypes
 import logging
 import struct
-from typing import List, Optional, Any, Tuple, Dict, TypeVar, Type
 from copy import copy
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar
 
 import numpy as np
 
-from .vlr import BaseVLR, VLR
-from ..extradims import (
-    get_dtype_for_extra_dim,
-)
+from ..extradims import get_dtype_for_extra_dim
 from ..point.format import ExtraBytesParams
 from ..utils import encode_to_null_terminated
+from .vlr import VLR, BaseVLR
 
 abstractmethod = abc.abstractmethod
 
@@ -510,12 +508,27 @@ class GeoKeyDirectoryVlr(BaseKnownVLR):
 
         # TODO import is done here to avoid cyclic import,
         # this should probably be fixed
-        from .geotiff import ProjectedCSTypeGeoKey, GeographicTypeGeoKey
+        from .geotiff import GeographicTypeGeoKey, ProjectedCSTypeGeoKey
 
+        geographic_cs = None
+        projected_cs = None
         for key in self.geo_keys:
-            if key.id == ProjectedCSTypeGeoKey.id or key.id == GeographicTypeGeoKey.id:
-                return pyproj.CRS.from_epsg(key.value_offset)
-        return None
+            if key.id == ProjectedCSTypeGeoKey.id:
+                if 1024 <= key.value_offset <= 32766:
+                    # http://docs.opengeospatial.org/is/19-008r4/19-008r4.html#_requirements_class_projectedcrsgeokey
+                    # "ProjectedCRSGeoKey values in the range 1024-32766 SHALL be EPSG Projected CRS Codes"
+                    projected_cs = pyproj.CRS.from_epsg(key.value_offset)
+            elif key.id == GeographicTypeGeoKey.id:
+                # http://docs.opengeospatial.org/is/19-008r4/19-008r4.html#_requirements_class_geodeticcrsgeokey
+                # GeodeticCRSGeoKey values in the range 1024-32766 SHALL be EPSG geographic 2D or geocentric CRS codes
+                if 1024 <= key.value_offset <= 32766:
+                    geographic_cs = pyproj.CRS.from_epsg(key.value_offset)
+
+        # Projected Coordinate Systems take precedence since,
+        # if they are present, the Geographic CS is probably
+        # redundant and the positioning information in the LAS
+        # file is projected.
+        return projected_cs or geographic_cs
 
     def __repr__(self):
         return "<{}({} geo_keys)>".format(self.__class__.__name__, len(self.geo_keys))

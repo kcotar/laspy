@@ -1,6 +1,76 @@
 # Changelog
 
-## 2.2.0
+## Version 2.5.1 (28/07/2023)
+
+### Fixed
+- Fixed bug in laz backend handling in the CLI
+
+## Version 2.5.0 (23/07/2023)
+
+### Added
+- Added optional CLI. It can be installed using the `cli` extra
+(`pip install laspy[cli]`). It has `info`, `compress`, `decompress`, `convert`
+and `copc query` commands.
+- Added a `prefer_wkt` option to `LasHeader.parse_crs`
+(true by default) to prefer (or not) WKT VLR over Geotiff VLR
+in case both are present in the file.
+
+### Fixed
+- laspy.open will now properly close the opened file
+if an exception is raised.
+- Wavepackets's `return_point_wave_location` is now
+properly returned as as float32 and not an uint32.
+- `parse_crs` properly checks that ProjectedCRSGeoKey/GeodeticCRSGeoKey
+is in range of EPSG code before using pyproj to parse it.
+- Missing `super.__init__()` in `CopcHierarchyVlr`.
+- Copc no longer include the hierarchy page twice
+- A LasHeader with a custom `creation_date`/`date` will
+no longer be reset to `date.today` upon writing.
+
+---
+
+
+## Version 2.4.1 (20/02/2022)
+
+### Fixed
+- Removed spurious `print` in copc.py and compression.py
+
+## Version 2.4.0 (11/02/2022)
+
+## Added
+- `read_evlrs` option (default true) to `laspy.open`, `laspy.LasReader.__init__` and `laspy.LasHeader.read_from`
+  Which allows to skip reading the EVLRs when opening a file. This can be useful when
+  opening a LAS file from a non seekable source / where seeking is expensive as reading
+  EVLRs requires seeking to the end of the file.
+- Selective decompression feature that allows to select in a LAS 1.4 (fmt >= 6 && <= 10)
+  which fields should be decompressed allowing to save time by decompressing only the fields
+  that are needed. Works with LAZ and COPC files.
+
+## Changed
+- The internal point reader is lazily created when the first point is actually read
+
+## Fixed
+- LasAppender when input file's last chunk is complete
+- Handle redundant CSs in GeoKeyDirectoryVlr
+
+## Version 2.3.0 (25/10/2022)
+
+### Changed
+- EVLRs are now read during the file opening part.
+- EVLRs are now part of the `LasHeader` class, but are still accesible
+  via `LasReader.evlrs` or `LasData.evlrs.
+
+### Fixed
+- Fixed CRS parsing on fiels with both `GeoKeyDirectoryVlr` and `WktCoordinateSystemVlr` and the first one is empty
+- `LasHeader.parse_crs` also looks for the CRS VLRs in the EVLRs of the file.
+- Fixed `LasHeader.generating_software` and `LasHeader.system_id` being limited to 31
+  bytes instead of 32.
+- Fixed `laspy.convert` to ensure the returng `LasData.evlrs` is a `Vlrlist` and
+  no simply a `list`
+
+---
+
+## Version 2.2.0 (29/06/2022)
 
 ### Added
 - Added support for querying COPC LAZ files via a new class `CopcReader`.
@@ -15,7 +85,7 @@
 
 ---
 
-## 2.2.0 beta 1
+## Version 2.2.0 beta 1 (14/06/2022)
 
 ### Added
 - Added support for querying COPC LAZ files via a new class `CopcReader`.
@@ -25,7 +95,7 @@
 
 ---
 
-## 2.2.0 beta 0
+## Version 2.2.0 beta 0 (03/05/2022)
 
 ### Added
 - Added new optional feature to support adding CRS / SRS to a LAS file from a `pyproj.CRS` as 
@@ -36,7 +106,7 @@
 
 ---
   
-## 2.1.2
+## Version 2.1.2 (18/02/2022)
 
 
 ### Fixed
@@ -46,7 +116,7 @@
 
 ---
 
-## 2.1.1
+## Version 2.1.1 (23/01/2022)
 
 ### Fixed
 - Fixed regression introduced in 2.1.0 where setting the x, y or z value would not properly set the corresponding
@@ -57,7 +127,7 @@
 
 ---
 
-## 2.1.0
+## Version 2.1.0 (09/01/2022)
 
 ### Added
 - Added a better error message when reading empty files
@@ -81,16 +151,16 @@
 
 ---
 
-## Version 2.0.3
+## Version 2.0.3 (16/09/2021)
 
-## Fixed
+### Fixed
 - Fix function that parses geotiff VLRs
 - Fix handling of points with 'unregistered' extra bytes (PR #158)
 - Fix to handle empty LAS/LAZ more robustly
 
 ---
 
-## Version 2.0.2
+## Version 2.0.2 (23/07/2021)
 
 ### Changed
 - Update minimum lazrs version which allows to:
@@ -103,7 +173,7 @@
 
 ---
 
-## Version 2.0.1
+## Version 2.0.1 (29/06/2021)
 
 ### Fixed
 - Fix `.min` `.max` methods of array views
@@ -111,7 +181,7 @@
 
 ---
 
-## Version 2.0.0
+## Version 2.0.0 (15/06/2021)
 
 - Overhaul of the internals by essentially incorporating pylas into laspy,
   while the API to retrieve and set dimensions stayed the same, other parts changed
@@ -126,24 +196,24 @@
 
 ---
 
-## Version 1.7.0
+## Version 1.7.0 (13/03/2020)
 
 - Fixed bug in point record format 5, 9 and 10 [#105](https://github.com/laspy/laspy/issues/105)
 - Return explicit msg if laszip executable was not found [#110](https://github.com/laspy/laspy/issues/110)
 - Supprt numpy 1.17 [#122](https://github.com/laspy/laspy/issues/122)
 
-## Version 1.6.0
+## Version 1.6.0 (11/10/2018)
 
 - Bug fix  [#92](https://github.com/laspy/laspy/issues/92)
 - Test creation of all valid custom dimension data types
 - Modify handling of extra bytes to be char data instead of numeric byte data
 
-## Version 1.5.1
+## Version 1.5.1 (5/12/2017)
 
 - Bug fixes [#67](https://github.com/laspy/laspy/pull/67), [#75](https://github.com/laspy/laspy/pull/75), [b02b40900b5](https://github.com/laspy/laspy/commit/b02b40900b5620972930cd0c201b4db1a6a69754)
 - Allow usage of `laszip-cli` when working with LAZ files [#77](https://github.com/laspy/laspy/pull/77)
 
-## Version 1.5.0
+## Version 1.5.0 (30/03/2017)
 
 - Improved memory handling in base.FileManager [#48](https://github.com/laspy/laspy/pull/48)
 - Introduced `r-` file mode, that only reads the header of as LAS file [#48](https://github.com/laspy/laspy/pull/48)

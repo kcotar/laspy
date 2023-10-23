@@ -4,33 +4,32 @@ import logging
 import struct
 import typing
 from datetime import date, timedelta
-from typing import NamedTuple, BinaryIO, Optional, List, Union, Iterable
+from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Union
 from uuid import UUID
 
 import numpy as np
 
-from . import extradims
-from .compression import (
+from . import __version__, extradims
+from ._compression.format import (
     compressed_id_to_uncompressed,
     is_point_format_compressed,
     uncompressed_id_to_compressed,
 )
 from .errors import LaspyException
 from .point import dims
-from .point.format import PointFormat, ExtraBytesParams
+from .point.format import ExtraBytesParams, PointFormat
 from .point.record import PackedPointRecord
-from .utils import read_string, write_as_c_string
+from .utils import read_string, write_string
 from .vlrs import VLR
 from .vlrs.geotiff import create_geotiff_projection_vlrs
 from .vlrs.known import (
     ExtraBytesStruct,
     ExtraBytesVlr,
-    WktCoordinateSystemVlr,
-    GeoKeyDirectoryVlr,
     GeoAsciiParamsVlr,
+    GeoKeyDirectoryVlr,
+    WktCoordinateSystemVlr,
 )
 from .vlrs.vlrlist import VLRList
-from . import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +217,7 @@ class LasHeader:
         #: Initialized to 'laspy'
         self.generating_software: Union[str, bytes] = DEFAULT_GENERATING_SOFTWARE
         self._point_format: PointFormat = point_format
-        #: Day the file was created, initialized to date.today()
+        #: Day the file was created, initialized to date.today
         self.creation_date: Optional[date] = date.today()
         #: The number of points in the file
         self.point_count: int = 0
@@ -252,7 +251,13 @@ class LasHeader:
         #: The number of evlrs in the file
         self.number_of_evlrs: int = 0
 
-        # Info we keep because its useful for us but not the user
+        #: EVLRs, even though they are not stored in the 'header'
+        #: part of the file we keep them in this class
+        #: as they contain same information as vlr.
+        #: None when the file does not support EVLR
+        self.evlrs: Optional[VLRList] = None
+
+        # Info we keep because it's useful for us but not the user
         self.offset_to_point_data: int = 0
         self.are_points_compressed: bool = False
 
@@ -417,8 +422,10 @@ class LasHeader:
             This requires `pyproj`.
 
         .. warning::
-            Not all CRS are supported when adding GeoTiff tags. For example, custom
-            CRS. Typically, if the CRS has an EPSG code it will be supported.
+            Not all CRS are supported when adding GeoTiff tags.
+            For example, custom CRS.
+
+            Typically, if the CRS has an EPSG code it will be supported.
         """
         import pyproj
 
@@ -459,8 +466,6 @@ class LasHeader:
         self.point_format = point_format
 
     def partial_reset(self) -> None:
-        self.creation_date = date.today()
-
         f64info = np.finfo(np.float64)
         self.maxs = np.ones(3, dtype=np.float64) * f64info.min
         self.mins = np.ones(3, dtype=np.float64) * f64info.max
@@ -476,7 +481,8 @@ class LasHeader:
             self.maxs = [0.0, 0.0, 0.0]
             self.mins = [0.0, 0.0, 0.0]
         else:
-            self.grow(points)
+            if self.update_header:
+                self.grow(points)
 
     def grow(self, points: PackedPointRecord) -> None:
         self.x_max = max(
@@ -517,12 +523,29 @@ class LasHeader:
     def set_compressed(self, state: bool) -> None:
         self.are_points_compressed = state
 
+    def max_point_count(self) -> int:
+        if self.version <= Version(1, 3):
+            return np.iinfo(np.uint32).max
+        else:
+            return np.iinfo(np.uint64).max
+
     @classmethod
-    def read_from(cls, stream: BinaryIO) -> "LasHeader":
+    def read_from(
+        cls, original_stream: BinaryIO, read_evlrs: bool = False
+    ) -> "LasHeader":
+        """
+        Reads the header from the stream
+
+        read_evlrs: If true, evlrs will be read
+
+        Leaves the stream pos right before the point starts
+        (regardless of is read_evlrs was true)
+
+        """
         little_endian = "little"
         header = cls()
 
-        stream = io.BytesIO(cls._prefetch_header_data(stream))
+        stream = io.BytesIO(cls._prefetch_header_data(original_stream))
 
         file_sig = stream.read(4)
         # This should not be possible as _prefetch already checks this
@@ -651,6 +674,10 @@ class LasHeader:
                 f"header says {point_size} point_format created says {point_format.size}"
             )
 
+        if read_evlrs:
+            header.read_evlrs(original_stream)
+            stream.seek(header.offset_to_point_data)
+
         return header
 
     def write_to(
@@ -665,6 +692,12 @@ class LasHeader:
         it originally had (meaning the file could become broken),
         Used when rewriting a header to update the file (new point count, mins, maxs, etc)
         """
+        if self.point_count > self.max_point_count():
+            raise LaspyException(
+                f"Version {self.version} cannot save clouds with more than"
+                f" {self.max_point_count()} points (current: {self.point_count})"
+            )
+
         little_endian = "little"
         with io.BytesIO() as tmp:
             self._vlrs.write_to(tmp, encoding_errors=encoding_errors)
@@ -688,7 +721,7 @@ class LasHeader:
         stream.write(self.version.major.to_bytes(1, little_endian, signed=False))
         stream.write(self.version.minor.to_bytes(1, little_endian, signed=False))
 
-        was_truncated = write_as_c_string(
+        was_truncated = write_string(
             stream,
             self.system_identifier,
             SYSTEM_IDENTIFIER_LEN,
@@ -700,7 +733,7 @@ class LasHeader:
                 f" it will be truncated"
             )
 
-        was_truncated = write_as_c_string(
+        was_truncated = write_string(
             stream,
             self.generating_software,
             GENERATING_SOFTWARE_LEN,
@@ -738,12 +771,6 @@ class LasHeader:
             for i in range(5):
                 stream.write(int(0).to_bytes(4, little_endian, signed=False))
         else:
-            if self.point_count > np.iinfo(np.uint32).max:
-                raise LaspyException(
-                    f"Version {self.version} cannot save clouds with more than"
-                    f" {np.iinfo(np.uint32).max} points"
-                )
-
             stream.write(self.point_count.to_bytes(4, little_endian, signed=False))
             for i in range(5):
                 stream.write(
@@ -783,23 +810,81 @@ class LasHeader:
         stream.write(vlr_bytes)
         stream.write(self.extra_vlr_bytes)
 
-    def parse_crs(self) -> Optional["pyproj.CRS"]:
+    def parse_crs(self, prefer_wkt=True) -> Optional["pyproj.CRS"]:
         """
         Method to parse OGC WKT or GeoTiff VLR keys into a pyproj CRS object
 
+        Returns None if no CRS VLR is present, or if the CRS specified
+        in the VLRS is not understood.
+
+
+        Parameters
+        ----------
+        prefer_wkt: Optional, default True,
+            If True the WKT VLR will be preferred in case
+            both the WKT and Geotiff VLR are present
+
         .. warning::
             This requires `pyproj`.
+
+        .. versionadded:: 2.5
+            The ``prefer_wkt`` parameters.
         """
 
         geo_vlr = self._vlrs.get_by_id("LASF_Projection")
 
+        if self.evlrs is not None:
+            geo_vlr.extend(self.evlrs.get_by_id("LASF_Projection"))
+
+        parsed_crs = {}
         for rec in geo_vlr:
             if isinstance(rec, (WktCoordinateSystemVlr, GeoKeyDirectoryVlr)):
                 crs = rec.parse_crs()
                 if crs is not None:
-                    return crs
+                    parsed_crs[type(rec)] = crs
 
-        return None
+        # Could not parse anything / there was nothing to parse
+        if not parsed_crs:
+            return None
+
+        if prefer_wkt:
+            preferred, other = WktCoordinateSystemVlr, GeoKeyDirectoryVlr
+        else:
+            preferred, other = GeoKeyDirectoryVlr, WktCoordinateSystemVlr
+
+        try:
+            return parsed_crs[preferred]
+        except KeyError:
+            return parsed_crs[other]
+
+    def read_evlrs(self, stream):
+        """
+        Reads EVLRs from the stream and sets them in the
+        data property.
+
+        The evlrs are accessed from the `evlrs` property
+
+        Does nothing if either of these is true:
+            - The file does not support EVLRS (version < 1.4)
+            - The file has no EVLRS
+            - The stream does not support seeking
+
+        Leaves/restores the stream position to where it was before the call
+        """
+        if self.version.minor >= 4:
+            if self.number_of_evlrs > 0 and stream.seekable():
+                saved_pos = stream.tell()
+                stream.seek(self.start_of_first_evlr, io.SEEK_SET)
+                self.evlrs = VLRList.read_from(
+                    stream, self.number_of_evlrs, extended=True
+                )
+                stream.seek(saved_pos)
+            elif self.number_of_evlrs > 0 and not stream.seekable():
+                self.evlrs = None
+            else:
+                self.evlrs = VLRList()
+        else:
+            self.evlrs = None
 
     @staticmethod
     def _prefetch_header_data(source) -> bytes:

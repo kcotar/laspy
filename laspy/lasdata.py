@@ -2,7 +2,7 @@ import logging
 import pathlib
 import typing
 from copy import deepcopy
-from typing import Union, Optional, List, Sequence, overload, BinaryIO, Iterable
+from typing import BinaryIO, Iterable, List, Optional, Sequence, Union, overload
 
 import numpy as np
 
@@ -10,8 +10,8 @@ from . import errors
 from .compression import LazBackend
 from .header import LasHeader
 from .laswriter import LasWriter
-from .point import record, dims, ExtraBytesParams, PointFormat
-from .point.dims import ScaledArrayView, SubFieldView, OLD_LASPY_NAMES
+from .point import ExtraBytesParams, PointFormat, dims, record
+from .point.dims import OLD_LASPY_NAMES, ScaledArrayView, SubFieldView
 from .point.record import DimensionNameValidity
 from .vlrs.vlrlist import VLRList
 
@@ -59,10 +59,6 @@ class LasData:
         self.__dict__["_points"] = points
         self.points: record.ScaleAwarePointRecord
         self.header: LasHeader = header
-        if header.version.minor >= 4:
-            self.evlrs: Optional[VLRList] = VLRList()
-        else:
-            self.evlrs: Optional[VLRList] = None
 
     @property
     def point_format(self) -> PointFormat:
@@ -112,6 +108,14 @@ class LasData:
     @vlrs.setter
     def vlrs(self, vlrs) -> None:
         self.header.vlrs = vlrs
+
+    @property
+    def evlrs(self) -> Optional[VLRList]:
+        return self.header.evlrs
+
+    @evlrs.setter
+    def evlrs(self, evlrs: VLRList) -> None:
+        self.header.evlrs = evlrs
 
     def add_extra_dim(self, params: ExtraBytesParams) -> None:
         """Adds a new extra dimension to the point record
