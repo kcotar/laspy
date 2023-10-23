@@ -481,8 +481,7 @@ class LasHeader:
             self.maxs = [0.0, 0.0, 0.0]
             self.mins = [0.0, 0.0, 0.0]
         else:
-            if self.update_header:
-                self.grow(points)
+            self.grow(points)
 
     def grow(self, points: PackedPointRecord) -> None:
         self.x_max = max(
