@@ -1,13 +1,16 @@
 import io
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import List, Tuple
 
+import numpy as np
 import pytest
 
 import laspy
 from laspy import LasData, LasHeader, ScaleAwarePointRecord
-from tests.conftest import NonSeekableStream
+from tests.conftest import SIMPLE_LAZ_FILE_PATH, NonSeekableStream
 from tests.test_common import simple_laz
 
 
@@ -65,7 +68,6 @@ def append_self_and_check(las_path_fixture):
     with open(las_path_fixture, mode="rb") as f:
         file = io.BytesIO(f.read())
     las = laspy.read(las_path_fixture)
-    print(las.vlrs)
     with laspy.open(file, mode="a", closefd=False) as laz_file:
         laz_file.append_points(las.points)
     file.seek(0, io.SEEK_SET)
@@ -157,3 +159,110 @@ def test_write_then_append_produces_valid_cloud(points_read_counts: List[int]) -
         ]
 
     check_write_append_read(points_list, las_reader.header)
+
+
+@pytest.mark.parametrize(
+    "input_file",
+    [SIMPLE_LAZ_FILE_PATH, Path(__file__).parent / "data" / "simple1_4.las"],
+)
+@pytest.mark.skipif(
+    not laspy.LazBackend.Lazrs.is_available(), reason="Lazrs is not installed"
+)
+def test_append_to_empty_file(input_file: Path) -> None:
+    """
+    Test that one can create an empty LAZ file, and then re-open it to append to it
+    """
+    laz_backends = laspy.LazBackend.detect_available()
+    input_las = laspy.read(input_file)
+
+    for creating_backend in laz_backends:
+        for appending_backend in laz_backends:
+            if appending_backend == laspy.LazBackend.Laszip:
+                continue
+
+            for checking_backend in laz_backends:
+                print(
+                    f"Creating Backend: {creating_backend},",
+                    f"Appending Backend: {appending_backend},",
+                    f"Checking Backend: {checking_backend}",
+                )
+                with tempfile.TemporaryDirectory() as dir_path:
+                    dir_path = Path(dir_path)
+                    las_path = dir_path / "to_be_appended.laz"
+
+                    header = input_las.header.copy()
+
+                    # Create empty laz
+                    with laspy.open(
+                        las_path, "w", header=header, laz_backend=creating_backend
+                    ) as las_writer:
+                        pass
+
+                    # Append points to empty laz
+                    with laspy.open(
+                        las_path, "a", laz_backend=appending_backend
+                    ) as las_appender:
+                        las_appender.append_points(input_las.points)
+
+                    # Try to read laz
+                    with laspy.open(
+                        las_path, "r", laz_backend=checking_backend
+                    ) as las_reader:
+                        point_count = las_reader.header.point_count
+                        points = las_reader.read_points(point_count)
+                        assert points == input_las.points
+
+
+@pytest.mark.skipif(
+    not laspy.LazBackend.Lazrs.is_available(), reason="Lazrs is not installed"
+)
+def test_append_issue_that_requires_passing_point_count():
+    """The input file in this test is composed of only one LAZ chunk.
+
+    LazAppend from used to decompress the last chunk until reaching the end
+    of its declared bytes.
+    However, in this file, the number of declared bytes is such that decompressing
+    all of it made laz-rs decompress on more point than expexted.
+
+    This point, which is not a real point, was then written back as part of the
+    standard appending preparation, however it was not registered in the point_count
+    that laspy was awere of.
+
+    All this lead to the fact that after appending some points and closing the file,
+    when reading it back to read the appended points, the first appended point was not
+    the one expected but it was the gargabe point mentionned above, and the last appended
+    point was not read (although it was in the file, just that the point_count was not correct)
+
+    The fix for this was to make the appenders from laz-rs require the caller (i.e laspy here)
+    to give point_count of the file, so that the correct number of points was decompressed
+    when doing the appender initialization
+    """
+    input_las = Path(__file__).parent / "data" / "append-bug.laz"
+    output_las = Path(__file__).parent / "data" / "append-bug-cpy.laz"
+
+    # check ini
+    las_input = laspy.read(input_las)
+    arr_ini = las_input.points.array
+    print("\nChecking initial points")
+    print("Input ", len(arr_ini), " points total ")
+    print("last point input ", arr_ini[len(arr_ini) - 1])
+
+    assert las_input.header.point_count == 37_805
+
+    shutil.copy2(input_las, output_las)
+    print("\nAdding points")
+    with laspy.open(
+        output_las, mode="a", laz_backend=laspy.LazBackend.Lazrs
+    ) as las:  # mode `a` for adding points
+        new_points = laspy.ScaleAwarePointRecord.zeros(
+            2, header=las.header
+        )  # use header for input_las
+        new_points.classification = [88, 89]
+        las.append_points(new_points)
+
+    # Check the result
+    las = laspy.read(output_las)
+    arr_end = las.points.array
+    assert len(arr_end) == 37_807
+
+    assert np.all(arr_end[-2:] == new_points.array)

@@ -66,7 +66,7 @@ use its method :meth:`.LasData.write` to write to a file or a stream.
     import laspy
 
     las = laspy.read("some_file.laz")
-    las.points[las.classification == 2]
+    las.points = las.points[las.classification == 2]
     las.write("ground.laz")
 
 Chunked Writing
@@ -154,7 +154,7 @@ To access point records using the dimension name, you have 2 options:
 
 >>> import numpy as np
 >>> las = laspy.read('tests/data/simple.las')
->>> np.all(las.user_data == las['user_data'])
+>>> bool(np.all(las.user_data == las['user_data']))
 True
 
 Point Format

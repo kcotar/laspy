@@ -1,9 +1,10 @@
-__version__ = "2.5.1"
+__version__ = "2.7.0"
 
 import logging
 
 from . import errors, file, vlrs
 from .copc import Bounds, CopcReader
+from .copcwriter import CopcWriter
 from .errors import LaspyException
 from .header import LasHeader
 from .lasdata import LasData

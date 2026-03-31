@@ -140,14 +140,12 @@ def test_rw_all_set_one(las):
         las[dim_name][:] = 1
 
     for dim_name in las.point_format.dimension_names:
-        assert np.alltrue(las[dim_name] == 1), "{} not equal".format(dim_name)
+        assert np.all(las[dim_name] == 1), "{} not equal".format(dim_name)
 
     las2 = write_then_read_again(las)
 
     for dim_name in las.point_format.dimension_names:
-        assert np.alltrue(las[dim_name] == las2[dim_name]), "{} not equal".format(
-            dim_name
-        )
+        assert np.all(las[dim_name] == las2[dim_name]), "{} not equal".format(dim_name)
 
 
 def test_coords_do_not_break(las):
@@ -348,6 +346,81 @@ def test_change_scaling():
     assert np.all(las.Z == [-2900, -2800, -2700, -2600])
 
 
+def test_automatic_scale_change_on_write():
+    """
+    Test that when passing ScaleAwarePointRecord to the LasWriter
+    a re-scaling is automatically done so that points coming from
+    different files (with possibly different scales/offsets)
+    are all under the same scales/offsets
+    """
+    hdr = laspy.LasHeader()
+    hdr.offsets = np.array([1.0, 1.0, 1.0])
+    hdr.scales = np.array([1.0, 1.0, 1.0])
+    hdr.point_format = laspy.PointFormat(3)
+
+    with io.BytesIO() as data:
+        with laspy.LasWriter(data, hdr, closefd=False) as writer:
+            points = laspy.ScaleAwarePointRecord.zeros(
+                4,
+                point_format=hdr.point_format,
+                scales=[1.0, 1.0, 1.0],
+                offsets=[0, 0, 0],
+            )
+            points.x = [1, 2, 3, 4]
+            points.y = [1, 2, 3, 4]
+            points.z = [1, 2, 3, 4]
+            writer.write_points(points)
+
+            points.change_scaling(scales=[0.5, 0.1, 0.01])
+            assert np.all(points.scales == [0.5, 0.1, 0.01])
+            assert np.all(points.offsets == [0, 0, 0])
+            assert np.all(points.x == [1, 2, 3, 4])
+            assert np.all(points.y == [1, 2, 3, 4])
+            assert np.all(points.z == [1, 2, 3, 4])
+            assert np.all(points.X == [2, 4, 6, 8])
+            assert np.all(points.Y == [10, 20, 30, 40])
+            assert np.all(points.Z == [100, 200, 300, 400])
+            writer.write_points(points)
+            # Make sure the input points did not change
+            assert np.all(points.scales == [0.5, 0.1, 0.01])
+            assert np.all(points.offsets == [0, 0, 0])
+            assert np.all(points.x == [1, 2, 3, 4])
+            assert np.all(points.y == [1, 2, 3, 4])
+            assert np.all(points.z == [1, 2, 3, 4])
+            assert np.all(points.X == [2, 4, 6, 8])
+            assert np.all(points.Y == [10, 20, 30, 40])
+            assert np.all(points.Z == [100, 200, 300, 400])
+
+            points.change_scaling(offsets=[1, 20, 30])
+            assert np.all(points.scales == [0.5, 0.1, 0.01])
+            assert np.all(points.offsets == [1, 20, 30])
+            assert np.all(points.x == [1, 2, 3, 4])
+            assert np.all(points.y == [1, 2, 3, 4])
+            assert np.all(points.z == [1, 2, 3, 4])
+            assert np.all(points.X == [0, 2, 4, 6])
+            assert np.all(points.Y == [-190, -180, -170, -160])
+            assert np.all(points.Z == [-2900, -2800, -2700, -2600])
+            writer.write_points(points)
+            # Make sure the input points did not change
+            assert np.all(points.scales == [0.5, 0.1, 0.01])
+            assert np.all(points.offsets == [1, 20, 30])
+            assert np.all(points.x == [1, 2, 3, 4])
+            assert np.all(points.y == [1, 2, 3, 4])
+            assert np.all(points.z == [1, 2, 3, 4])
+            assert np.all(points.X == [0, 2, 4, 6])
+            assert np.all(points.Y == [-190, -180, -170, -160])
+            assert np.all(points.Z == [-2900, -2800, -2700, -2600])
+
+        data.seek(0)
+        las = laspy.read(data)
+        assert np.all(las.x == np.array([1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]))
+        assert np.all(las.y == np.array([1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]))
+        assert np.all(las.z == np.array([1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]))
+        assert np.all(las.X == np.array([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]))
+        assert np.all(las.Y == np.array([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]))
+        assert np.all(las.Z == np.array([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]))
+
+
 def test_setting_x_y_z_on_las_data():
     """
     The goal of this test if to make sure that when setting the `x`,`y` and `z`
@@ -428,3 +501,11 @@ def test_input_is_properly_closed_if_opening_fails():
         _ = laspy.read(data, closefd=False)
 
     assert data.closed is False
+
+
+@pytest.mark.parametrize("backend", laspy.LazBackend.detect_available())
+def test_create_and_write_compressed_wavepackets_formats(backend):
+    for fmt in (4, 5, 9, 10):
+        las = laspy.create(point_format=fmt)
+
+        _ = write_then_read_again(las, do_compress=True, laz_backend=backend)

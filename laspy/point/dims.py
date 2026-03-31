@@ -1,7 +1,8 @@
-"""  This module contains things like the definitions of the point formats dimensions,
+"""This module contains things like the definitions of the point formats dimensions,
 the mapping between dimension names and their type, mapping between point format and
 compatible file version
 """
+
 import abc
 import collections
 import operator
@@ -265,6 +266,7 @@ VERSION_TO_POINT_FMT: Dict[str, Tuple[int, ...]] = {
     "1.2": (0, 1, 2, 3),
     "1.3": (0, 1, 2, 3, 4, 5),
     "1.4": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+    "1.5": (6, 7, 8, 9, 10),
 }
 
 POINT_FORMATS_DTYPE = PointFormatDict(
@@ -336,6 +338,7 @@ class DimensionInfo(NamedTuple):
     description: str = ""
     offsets: Optional[np.ndarray] = None
     scales: Optional[np.ndarray] = None
+    no_data: Optional[np.ndarray] = None
 
     @classmethod
     def from_extra_bytes_param(cls, params):
@@ -348,6 +351,7 @@ class DimensionInfo(NamedTuple):
             params.description,
             params.offsets,
             params.scales,
+            params.no_data,
         )
         me._validate()
         return me
@@ -475,6 +479,11 @@ class DimensionInfo(NamedTuple):
                 f"len(scales) ({len(self.scales)}) is not the same as the number of elements ({self.num_elements})"
             )
 
+        if self.no_data is not None and len(self.no_data) != self.num_elements:
+            raise ValueError(
+                f"len(no_data) ({len(self.no_data)}) is not the same as the number of elements ({self.num_elements})"
+            )
+
 
 def size_of_point_format_id(point_format_id: int) -> int:
     return ALL_POINT_FORMATS_DTYPE[point_format_id].itemsize
@@ -547,16 +556,13 @@ class ArrayView(abc.ABC):
         self.array = array
 
     @abc.abstractmethod
-    def __array__(self, *args, **kwargs) -> np.ndarray:
-        ...
+    def __array__(self, *args, **kwargs) -> np.ndarray: ...
 
     @abc.abstractmethod
-    def __getitem__(self, item):
-        ...
+    def __getitem__(self, item): ...
 
     @abc.abstractmethod
-    def __setitem__(self, key, value):
-        ...
+    def __setitem__(self, key, value): ...
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         inpts = _convert_array_views_to_array(self.__class__, inputs)
@@ -676,9 +682,14 @@ class SubFieldView(ArrayView):
             raise OverflowError(
                 f"value {np.max(value)} is greater than allowed (max: {self.max_value_allowed})"
             )
-        value = np.array(value, copy=False).astype(self.array.dtype)
+        value = np.asarray(value)
         self.array[key] &= ~self.bit_mask
-        self.array[key] |= value << self.lsb
+
+        # This is not allowed without a casting="unsafe" argument
+        # in Numpy 2.0
+        # self.array[key] |= shifted
+        shifted = value << self.lsb
+        self.array[key] = np.bitwise_or(self.array[key], shifted, casting="unsafe")
 
     def __getitem__(self, item):
         sliced = SubFieldView(self.array[item], int(self.bit_mask))
@@ -707,8 +718,11 @@ class ScaledArrayView(ArrayView):
     def _apply_scale(self, value):
         return (value * self.scale) + self.offset
 
-    def _remove_scale(self, value):
-        return np.round((value - self.offset) / self.scale)
+    def _remove_scale(self, value, sub=None):
+        if sub is None:
+            return np.round((value - self.offset) / self.scale)
+        else:
+            return np.round((value - self.offset[sub]) / self.scale[sub])
 
     def max(self, *args, **kwargs):
         return self._apply_scale(self.array.max(*args, **kwargs))
@@ -759,8 +773,8 @@ class ScaledArrayView(ArrayView):
                     # item is (index, ...), it queries for all the dimensions
                     # of a point or set of point, so we don't slice the scales/offsets
                     return self.__class__(sliced_array, self.scale, self.offset)
-                elif item[0] is Ellipsis:
-                    # item is something like (..., index)
+                else:
+                    # item is something like (something, index)
                     # it queries for one dimension or set of dimension
                     # for all the points, so we need to slice the scales/offsets
                     return self.__class__(
@@ -790,7 +804,16 @@ class ScaledArrayView(ArrayView):
             )
         if isinstance(value, ScaledArrayView):
             value = np.array(value)
-        self.array[key] = self._remove_scale(value)
+
+        try:
+            key_len = len(key)
+        except TypeError:
+            key_len = 1
+
+        if key_len == 2:
+            self.array[key] = self._remove_scale(value, sub=key[1])
+        else:
+            self.array[key] = self._remove_scale(value)
 
     def __repr__(self):
         return f"<ScaledArrayView({self.scaled_array()})>"

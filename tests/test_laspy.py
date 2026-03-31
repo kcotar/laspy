@@ -195,7 +195,7 @@ class LasWriterTestCase(unittest.TestCase):
 
     def test_overflow_return_num(self):
         """Testing overflow handling"""
-        rn = self.FileObject.return_num + 100000
+        rn = np.array(self.FileObject.return_num, dtype=np.uint32) + 100000
         with self.assertRaises(OverflowError):
             self.FileObject.return_num = rn
 

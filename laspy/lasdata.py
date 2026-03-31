@@ -76,7 +76,7 @@ class LasData:
         2
         >>> xyz.shape
         (1065, 3)
-        >>> np.all(xyz[..., 0] == las.x)
+        >>> bool(np.all(xyz[..., 0] == las.x))
         True
         """
         return np.vstack((self.x, self.y, self.z)).transpose()
@@ -231,8 +231,7 @@ class LasData:
         self,
         destination: str,
         laz_backend: Optional[Union[LazBackend, Sequence[LazBackend]]] = ...,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @overload
     def write(
@@ -240,10 +239,9 @@ class LasData:
         destination: BinaryIO,
         do_compress: Optional[bool] = ...,
         laz_backend: Optional[Union[LazBackend, Sequence[LazBackend]]] = ...,
-    ) -> None:
-        ...
+    ) -> None: ...
 
-    def write(self, destination, do_compress=None, laz_backend=None):
+    def write(self, destination, do_compress=None, laz_backend=None, update_header=True):
         """Writes to a stream or file
 
         .. note::
@@ -251,6 +249,7 @@ class LasData:
             When destination is a string, it will be interpreted as the path were the file should be written to,
             and whether the file will be compressed depends on the extension used (case insensitive):
 
+                - .copc.laz -> COPC (Cloud Optimized Point Cloud)
                 - .laz -> compressed
                 - .las -> uncompressed
 
@@ -265,15 +264,26 @@ class LasData:
             Flags to indicate if you want to compress the data
         laz_backend: optional, the laz backend to use
             By default, laspy detect available backends
+        update_header: bool, optional
+            Flags to indicate if you want to update header before data are written
         """
         if isinstance(destination, (str, pathlib.Path)):
+            dest_str = str(destination).lower()
+            if dest_str.endswith(".copc.laz"):
+                from .copcwriter import CopcWriter
+
+                CopcWriter.write(str(destination), self.header, self.points)
+                return
+
             do_compress = pathlib.Path(destination).suffix.lower() == ".laz"
 
             with open(destination, mode="wb+") as out:
-                self._write_to(out, do_compress=do_compress, laz_backend=laz_backend)
+                self._write_to(
+                    out, do_compress=do_compress, laz_backend=laz_backend, update_header=update_header
+                )
         else:
             self._write_to(
-                destination, do_compress=do_compress, laz_backend=laz_backend
+                destination, do_compress=do_compress, laz_backend=laz_backend, update_header=update_header
             )
 
     def _write_to(
@@ -281,6 +291,7 @@ class LasData:
         out_stream: BinaryIO,
         do_compress: Optional[bool] = None,
         laz_backend: Optional[Union[LazBackend, Sequence[LazBackend]]] = None,
+        update_header: Optional[bool] = None,
     ) -> None:
         with LasWriter(
             out_stream,
@@ -288,6 +299,7 @@ class LasData:
             do_compress=do_compress,
             closefd=False,
             laz_backend=laz_backend,
+            update_header=update_header,
         ) as writer:
             writer.write_points(self.points)
             if self.header.version.minor >= 4 and self.evlrs is not None:
@@ -411,12 +423,12 @@ class LasData:
     @typing.overload
     def __getitem__(
         self, item: Union[str, List[str]]
-    ) -> Union[np.ndarray, ScaledArrayView, SubFieldView]:
-        ...
+    ) -> Union[np.ndarray, ScaledArrayView, SubFieldView]: ...
 
     @typing.overload
-    def __getitem__(self, item: Union[int, typing.Iterable[int], slice]) -> "LasData":
-        ...
+    def __getitem__(
+        self, item: Union[int, typing.Iterable[int], slice]
+    ) -> "LasData": ...
 
     def __getitem__(self, item):
         try:

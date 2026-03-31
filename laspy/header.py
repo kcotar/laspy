@@ -3,6 +3,7 @@ import io
 import logging
 import struct
 import typing
+from copy import deepcopy
 from datetime import date, timedelta
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Union
 from uuid import UUID
@@ -71,6 +72,8 @@ class GlobalEncoding:
     WAVEFORM_EXTERNAL_MASK = 0b0000_0000_0000_0100  # 1.3
     SYNTHETIC_RETURN_NUMBERS_MASK = 0b0000_0000_0000_1000  # 1.3
     WKT_MASK = 0b0000_0000_0001_0000  # 1.4
+    RESERVED = 0b0000_0000_0010_0000
+    GPS_TIME_OFFSET_MASK = 0b0000_0000_0100_0000
 
     def __init__(self, value=0):
         self.value = value
@@ -79,7 +82,7 @@ class GlobalEncoding:
         self.value |= mask
 
     def _unset_bit(self, mask):
-        self.value ^= mask
+        self.value &= ~mask
 
     def _set_if_true(self, mask, value):
         if bool(value) is True:
@@ -93,7 +96,7 @@ class GlobalEncoding:
 
     @gps_time_type.setter
     def gps_time_type(self, value: GpsTimeType):
-        self.value ^= self.GPS_TIME_TYPE_MASK
+        self.value &= ~self.GPS_TIME_TYPE_MASK
         self.value |= int(value) & self.GPS_TIME_TYPE_MASK
 
     @property
@@ -127,6 +130,18 @@ class GlobalEncoding:
     @wkt.setter
     def wkt(self, value):
         self._set_if_true(self.WKT_MASK, value)
+
+    @property
+    def gps_time_offset(self) -> bool:
+        return bool(self.value & self.GPS_TIME_OFFSET_MASK)
+
+    @gps_time_offset.setter
+    def gps_time_offset(self, value):
+        self._set_if_true(self.GPS_TIME_OFFSET_MASK, value)
+        if value:
+            # Standard says that of the offset mask is true,
+            # then the gps time type must also be
+            self._set_if_true(self.GPS_TIME_TYPE_MASK, value)
 
     @classmethod
     def read_from(cls, stream: BinaryIO) -> "GlobalEncoding":
@@ -194,7 +209,7 @@ class LasHeader:
 
         if version is None and point_format is None:
             version = LasHeader.DEFAULT_VERSION
-            point_format = LasHeader.DEFAULT_POINT_FORMAT
+            point_format = deepcopy(LasHeader.DEFAULT_POINT_FORMAT)
         elif version is not None and point_format is None:
             point_format = PointFormat(dims.min_point_format_for_version(str(version)))
         elif version is None and point_format is not None:
@@ -232,7 +247,7 @@ class LasHeader:
 
         #: Number of points by return
         #: for las <= 1.2 only the first 5 elements matters
-        self.number_of_points_by_return: np.ndarray = np.zeros(15, dtype=np.uint32)
+        self.number_of_points_by_return: np.ndarray = np.zeros(15, dtype=np.uint64)
 
         #: The VLRS
         self._vlrs: VLRList = VLRList()
@@ -250,6 +265,14 @@ class LasHeader:
         self.start_of_first_evlr: int = 0
         #: The number of evlrs in the file
         self.number_of_evlrs: int = 0
+
+        #: Las >= 1.5
+        #: Max value of GPS Time
+        self.max_gps_time: float = 0.0
+        #: Min value of GPS Time
+        self.min_gps_time: float = 0.0
+        #: Used to optimize GPS Time precision
+        self.gps_time_offset: int = 0
 
         #: EVLRs, even though they are not stored in the 'header'
         #: part of the file we keep them in this class
@@ -470,10 +493,19 @@ class LasHeader:
         self.maxs = np.ones(3, dtype=np.float64) * f64info.min
         self.mins = np.ones(3, dtype=np.float64) * f64info.max
 
+        self.max_gps_time = float(f64info.min)
+        self.min_gps_time = float(f64info.max)
+
         self.start_of_first_evlr = 0
         self.number_of_evlrs = 0
         self.point_count = 0
-        self.number_of_points_by_return = np.zeros(15, dtype=np.uint32)
+        self.number_of_points_by_return = np.zeros(15, dtype=np.uint64)
+
+        try:
+            eb_vlr = self.vlrs.get("ExtraBytesVlr")[0]
+            eb_vlr.partial_reset()
+        except IndexError:
+            pass
 
     def update(self, points: PackedPointRecord) -> None:
         self.partial_reset()
@@ -509,6 +541,13 @@ class LasHeader:
             (points["Z"].min() * self.z_scale) + self.z_offset,
         )
 
+        try:
+            gps_time = points["gps_time"]
+            self.max_gps_time = max(self.max_gps_time, gps_time.max())
+            self.min_gps_time = min(self.min_gps_time, gps_time.min())
+        except ValueError:
+            pass
+
         for return_number, count in zip(
             *np.unique(points.return_number, return_counts=True)
         ):
@@ -519,6 +558,11 @@ class LasHeader:
             self.number_of_points_by_return[return_number - 1] += count
         self.point_count += len(points)
 
+        # grow extra bytes
+        vlrs = self.vlrs.get("ExtraBytesVlr")
+        if vlrs:
+            vlrs[0].grow(points)
+
     def set_compressed(self, state: bool) -> None:
         self.are_points_compressed = state
 
@@ -527,6 +571,9 @@ class LasHeader:
             return np.iinfo(np.uint32).max
         else:
             return np.iinfo(np.uint64).max
+
+    def copy(self):
+        return deepcopy(self)
 
     @classmethod
     def read_from(
@@ -616,6 +663,12 @@ class LasHeader:
                 header.number_of_points_by_return[i] = int.from_bytes(
                     stream.read(8), little_endian, signed=False
                 )
+        if header.version.minor >= 5:
+            header.max_gps_time = struct.unpack("<d", stream.read(8))[0]
+            header.min_gps_time = struct.unpack("<d", stream.read(8))[0]
+            header.gps_time_offset = int.from_bytes(
+                stream.read(2), little_endian, signed=False
+            )
 
         current_pos = stream.tell()
         if current_pos < header_size:
@@ -805,6 +858,12 @@ class LasHeader:
                         8, little_endian, signed=False
                     )
                 )
+
+        if self.version.minor >= 5:
+            stream.write(struct.pack("<d", self.max_gps_time))
+            stream.write(struct.pack("<d", self.min_gps_time))
+            stream.write(self.gps_time_offset.to_bytes(2, little_endian, signed=False))
+
         stream.write(self.extra_header_bytes)
         stream.write(vlr_bytes)
         stream.write(self.extra_vlr_bytes)
@@ -932,21 +991,19 @@ class LasHeader:
             dtype = extra_dimension.dtype
             assert dtype is not None
 
+            if extra_dimension.num_elements > 3 and dtype.base == np.uint8:
+                data_type = (0, extra_dimension.num_elements)
+            else:
+                data_type = extradims.get_id_for_extra_dim_type(dtype)
+
             eb_struct = ExtraBytesStruct(
                 name=extra_dimension.name.encode(),
                 description=extra_dimension.description.encode(),
+                data_type=data_type,
+                scale=extra_dimension.scales,
+                offset=extra_dimension.offsets,
+                no_data=extra_dimension.no_data,
             )
-
-            if extra_dimension.num_elements > 3 and dtype.base == np.uint8:
-                type_id = 0
-                eb_struct.options = extra_dimension.num_elements
-            else:
-                type_id = extradims.get_id_for_extra_dim_type(dtype)
-
-            eb_struct.data_type = type_id
-            eb_struct.scale = extra_dimension.scales
-            eb_struct.offset = extra_dimension.offsets
-
             eb_vlr.extra_bytes_structs.append(eb_struct)
 
         self._vlrs.append(eb_vlr)
@@ -981,4 +1038,5 @@ LAS_HEADERS_SIZE = {
     "1.2": 227,
     "1.3": 235,
     "1.4": 375,
+    "1.5": 393,
 }

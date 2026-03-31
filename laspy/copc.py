@@ -148,7 +148,18 @@ class CopcInfoVlr(BaseKnownVLR):
         return (1,)
 
     def record_data_bytes(self):
-        raise NotImplementedError("Writing COPC is not supported")
+        data = bytearray()
+        for i in range(3):
+            data += struct.pack("<d", self.center[i])
+        data += struct.pack("<d", self.halfsize)
+        data += struct.pack("<d", self.spacing)
+        data += struct.pack("<Q", self.hierarchy_root_offset)
+        data += struct.pack("<Q", self.hierarchy_root_size)
+        data += struct.pack("<d", self.gps_min)
+        data += struct.pack("<d", self.gps_max)
+        # 11 reserved uint64 fields, must be 0
+        data += b"\x00" * 88
+        return bytes(data)
 
     def parse_record_data(self, record_data_bytes: bytes):
         stream = io.BytesIO(record_data_bytes)
@@ -205,6 +216,18 @@ class VoxelKey:
         key = cls()
         key.level, key.x, key.y, key.z = cls.unpacker.unpack(data)
         return key
+
+    @classmethod
+    def from_values(cls, level: int, x: int, y: int, z: int) -> "VoxelKey":
+        key = cls()
+        key.level = level
+        key.x = x
+        key.y = y
+        key.z = z
+        return key
+
+    def to_bytes(self) -> bytes:
+        return self.unpacker.pack(self.level, self.x, self.y, self.z)
 
     def child(self, dir: int) -> "VoxelKey":
         key = VoxelKey()
@@ -278,6 +301,11 @@ class Entry:
 
         return entry
 
+    def to_bytes(self) -> bytes:
+        return self.key.to_bytes() + self.unpacker.pack(
+            self.offset, self.byte_size, self.point_count
+        )
+
     def __repr__(self) -> str:
         return f"Entry(key={self.key}, offset={self.offset}, byte_size={self.byte_size}, point_count={self.point_count})"
 
@@ -323,12 +351,12 @@ class CopcHierarchyVlr(BaseKnownVLR):
         return (1000,)
 
     def record_data_bytes(self):
-        raise NotImplementedError("Writing COPC is not supported")
+        return self.data
 
     def parse_record_data(self, record_data_bytes: bytes):
         # We just save the bytes as to parse them we need some
         # info from the CopcInfoVlr
-        self.bytes = record_data_bytes
+        self.data = record_data_bytes
 
 
 class OctreeNode:
@@ -406,7 +434,7 @@ def load_octree_for_query(
             hierarchy_page.entries.update(page.entries)
             nodes_to_load.insert(0, current_node)
             continue
-        elif entry.point_count != 0:
+        elif entry.point_count >= 0:
             current_node.offset = entry.offset
             current_node.byte_size = entry.byte_size
             current_node.point_count = entry.point_count
@@ -539,7 +567,7 @@ class CopcReader:
     (Octree) making it possible to do spatial queries
     as well as queries with a level of details.
 
-    CopcReader **requires** the ``lazrz`` backend to work.
+    CopcReader **requires** the ``lazrs`` backend to work.
 
     Optionaly, if ``requests`` is installed, CopcReader can handle
     Copc files that are on a remote HTTP server
@@ -766,7 +794,7 @@ class CopcReader:
             level_range=level,
         )
         # print("num nodes to query:", len(nodes));
-        points = self._fetch_and_decrompress_points_of_nodes(nodes)
+        points = self._fetch_and_decompress_points_of_nodes(nodes)
 
         if bounds is not None:
             MINS = np.round(
@@ -795,7 +823,7 @@ class CopcReader:
     def level_query(self, level: Union[int, range]) -> ScaleAwarePointRecord:
         return self.query(bounds=None, level=level)
 
-    def _fetch_and_decrompress_points_of_nodes(
+    def _fetch_and_decompress_points_of_nodes(
         self, nodes_to_read: List[OctreeNode]
     ) -> ScaleAwarePointRecord:
         if not nodes_to_read:
