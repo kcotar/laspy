@@ -21,6 +21,12 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
+# Number of voxel grid cells per axis used when subsampling an octree node.
+# One point per cell is kept at each internal node; the rest are pushed to
+# children.  Matches the ChildCellCount constant in PDAL's COPC writer
+# (int(128 * sqrt(3)) ≈ 221), which gives a similar point density per level.
+_CELL_COUNT = 128
+
 
 @dataclass
 class OctreeChunk:
@@ -70,7 +76,7 @@ def _build_octree(
         if n_points <= target_points_per_node:
             max_depth = 0
         else:
-            max_depth = min(20, max(1, int(ceil(log2(n_points / target_points_per_node) / 3)) + 1))
+            max_depth = min(20, max(1, int(ceil(log2(n_points / target_points_per_node) / 3)) + 2))
 
     # BFS octree construction with LOD subsampling.
     # At each internal node, keep a subsample of points for that LOD level
@@ -82,42 +88,53 @@ def _build_octree(
     queue = deque()
     queue.append((root_key, all_indices))
 
-    # Root bounds: center ± halfsize (cube)
     root_mins = center - halfsize
-    root_maxs = center + halfsize
-
     max_depth_used = 0
 
     while queue:
         key, indices = queue.popleft()
 
-        if len(indices) <= target_points_per_node or key.level >= max_depth:
+        if len(indices) == 0:
+            continue
+
+        if key.level >= max_depth:
             # Leaf node: store all remaining points
             chunks.append(OctreeChunk(key=key, point_indices=indices))
             if key.level > max_depth_used:
                 max_depth_used = key.level
             continue
 
-        # Internal node: subsample points for this LOD level.
-        # Keep every 8th point at this level, push the rest to children.
-        # This gives a uniform subsampling that works well for LOD.
+        # Internal node: voxel-occupancy subsampling.
+        # Divide the node into a _CELL_COUNT³ grid; keep the first point that
+        # lands in each occupied cell (after a random shuffle) and push the
+        # rest to children.  This produces back-loaded trees where the root
+        # holds a sparse, spatially uniform sample — matching PDAL's behaviour
+        # and enabling efficient progressive loading in Potree / web viewers.
+        node_side = (2.0 * halfsize) / (2 ** key.level)
+        node_min = root_mins + np.array([key.x, key.y, key.z], dtype=np.float64) * node_side
+        cell_w = node_side / _CELL_COUNT
+
+        gx = np.clip(((actual_x[indices] - node_min[0]) / cell_w).astype(np.int32), 0, _CELL_COUNT - 1)
+        gy = np.clip(((actual_y[indices] - node_min[1]) / cell_w).astype(np.int32), 0, _CELL_COUNT - 1)
+        gz = np.clip(((actual_z[indices] - node_min[2]) / cell_w).astype(np.int32), 0, _CELL_COUNT - 1)
+        grid_keys = (gx.astype(np.int64) * _CELL_COUNT + gy.astype(np.int64)) * _CELL_COUNT + gz.astype(np.int64)
+
         np.random.seed(key.level * 1000 + key.x * 100 + key.y * 10 + key.z)
         perm = np.random.permutation(len(indices))
-        n_keep = max(1, len(indices) // 8)
+        _, first_occ = np.unique(grid_keys[perm], return_index=True)
+
         keep_mask = np.zeros(len(indices), dtype=bool)
-        keep_mask[perm[:n_keep]] = True
+        keep_mask[first_occ] = True
 
-        node_indices = indices[keep_mask]
-        remaining_indices = indices[~keep_mask]
+        node_indices = indices[perm[first_occ]]
+        remaining_indices = indices[perm[~keep_mask]]
 
-        # Store the subsampled points at this node
         chunks.append(OctreeChunk(key=key, point_indices=node_indices))
+        if key.level > max_depth_used:
+            max_depth_used = key.level
 
-        # Subdivide remaining points into 8 children
-        side_size = (root_maxs[0] - root_mins[0]) / (2 ** key.level)
-        node_mins = root_mins + np.array([key.x, key.y, key.z], dtype=np.float64) * side_size
-        node_center = node_mins + side_size / 2.0
-
+        # Partition remaining points into 8 children by octant
+        node_center = node_min + node_side / 2.0
         px = actual_x[remaining_indices]
         py = actual_y[remaining_indices]
         pz = actual_z[remaining_indices]
@@ -129,16 +146,15 @@ def _build_octree(
         )
 
         for direction in range(8):
-            mask = octant == direction
-            child_indices = remaining_indices[mask]
+            child_indices = remaining_indices[octant == direction]
             if len(child_indices) > 0:
-                child_key = key.child(direction)
-                queue.append((child_key, child_indices))
+                queue.append((key.child(direction), child_indices))
 
-    # Sort chunks by level (breadth-first order)
     chunks.sort(key=lambda c: (c.key.level, c.key.x, c.key.y, c.key.z))
 
-    spacing = (halfsize * 2.0) / (2 ** max_depth_used) if max_depth_used > 0 else halfsize * 2.0
+    # Spacing reflects the voxel cell width at the root — the minimum
+    # distance between points stored at LOD level 0.
+    spacing = (2.0 * halfsize) / _CELL_COUNT
 
     return OctreeResult(
         chunks=chunks,
@@ -209,6 +225,10 @@ class CopcWriter:
         header = deepcopy(header)
         header.are_points_compressed = True
         header.point_count = len(points)
+        # CopcWriter stores hierarchy via CopcInfoVlr, not as LAS EVLRs.
+        # Clear these fields to prevent readers from seeking to a stale/zero offset.
+        header.start_of_first_evlr = 0
+        header.number_of_evlrs = 0
 
         # Update bounds
         if len(points) > 0:
