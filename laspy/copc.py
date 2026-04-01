@@ -118,7 +118,7 @@ class HttpRangeStream:
 
 class CopcInfoVlr(BaseKnownVLR):
     def __init__(self):
-        super().__init__()
+        super().__init__(description="COPC info VLR")
 
         # Actual (unscaled) coordinate of the center of the octree
         self.center = np.zeros(3, dtype=np.float64)
@@ -338,7 +338,7 @@ class CopcHierarchyVlr(BaseKnownVLR):
     """
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(description="EPT Hierarchy")
         self.data: bytes = b""
         self.root_page = HierarchyPage()
 

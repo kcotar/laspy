@@ -3,16 +3,17 @@ import logging
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
-from math import ceil, log2
+from math import floor
 from typing import BinaryIO, List, Optional, Union
 
 import numpy as np
 
-from .copc import CopcInfoVlr, Entry, VoxelKey
+from .copc import CopcHierarchyVlr, CopcInfoVlr, Entry, VoxelKey
 from .errors import LaspyException
 from .header import LasHeader
 from .point.record import PackedPointRecord
 from .vlrs.known import LasZipVlr
+from .vlrs.vlrlist import VLRList
 
 try:
     import lazrs
@@ -21,11 +22,38 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
-# Number of voxel grid cells per axis used when subsampling an octree node.
-# One point per cell is kept at each internal node; the rest are pushed to
-# children.  Matches the ChildCellCount constant in PDAL's COPC writer
-# (int(128 * sqrt(3)) ≈ 221), which gives a similar point density per level.
-_CELL_COUNT = 128
+_MORTON_BITS = 21                        # bits per dimension in Morton code
+_MORTON_MAX  = (1 << _MORTON_BITS) - 1  # 2097151
+
+
+def _spread_bits(v: np.ndarray) -> np.ndarray:
+    """Spread 21-bit integers to every 3rd bit position for 63-bit Morton encoding."""
+    v = v.astype(np.uint64) & np.uint64(0x1FFFFF)
+    v = (v | (v << np.uint64(32))) & np.uint64(0x1F00000000FFFF)
+    v = (v | (v << np.uint64(16))) & np.uint64(0x1F0000FF0000FF)
+    v = (v | (v << np.uint64(8)))  & np.uint64(0x100F00F00F00F00F)
+    v = (v | (v << np.uint64(4)))  & np.uint64(0x10C30C30C30C30C3)
+    v = (v | (v << np.uint64(2)))  & np.uint64(0x1249249249249249)
+    return v
+
+
+def _morton_codes(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    root_min: np.ndarray,
+    side: float,
+) -> np.ndarray:
+    """Compute 63-bit Morton (Z-order) codes for arrays of 3D coordinates.
+
+    Quantises each axis to _MORTON_BITS bits then interleaves the bits.
+    All points are assumed to lie within [root_min, root_min + side].
+    """
+    scale = side / _MORTON_MAX
+    qx = np.clip(((x - root_min[0]) / scale), 0, _MORTON_MAX).astype(np.uint64)
+    qy = np.clip(((y - root_min[1]) / scale), 0, _MORTON_MAX).astype(np.uint64)
+    qz = np.clip(((z - root_min[2]) / scale), 0, _MORTON_MAX).astype(np.uint64)
+    return _spread_bits(qx) | (_spread_bits(qy) << np.uint64(1)) | (_spread_bits(qz) << np.uint64(2))
 
 
 @dataclass
@@ -65,30 +93,39 @@ def _build_octree(
         [actual_x.max(), actual_y.max(), actual_z.max()], dtype=np.float64
     )
 
-    center = (mins + maxs) / 2.0
     halfsize = float(np.max(maxs - mins)) / 2.0
+    center = mins + halfsize
 
     if halfsize == 0.0:
         halfsize = 1.0
 
     n_points = len(points)
     if max_depth is None:
-        if n_points <= target_points_per_node:
-            max_depth = 0
-        else:
-            max_depth = min(20, max(1, int(ceil(log2(n_points / target_points_per_node) / 3)) + 2))
+        # Safety cap only — the adaptive leaf criterion below drives actual depth.
+        # Matches PDAL: keep splitting until every leaf has <= target_points_per_node.
+        max_depth = 20
+
+    # Adaptive cell count: scales with dataset size, matching PDAL's behaviour.
+    # floor(cbrt(N) * 2) gives ~147 for 411k points; minimum 128 for small files.
+    cell_count = max(128, floor(n_points ** (1.0 / 3.0) * 2))
+
+    root_min = center - halfsize
+
+    # Pre-sort all points once by Morton (Z-order) code.
+    # This replaces the per-node random shuffle: the BFS passes Morton-ordered
+    # index arrays to children, so np.unique's first-occurrence selection is
+    # deterministic and spatially coherent — matching PDAL's behaviour without
+    # any per-node sort.  Morton order is preserved through octant splits
+    # because Z-order is locality-preserving: all points of a child octant
+    # appear contiguously (and in Z-order) within the parent's sorted range.
+    codes = _morton_codes(actual_x, actual_y, actual_z, root_min, 2.0 * halfsize)
+    all_indices = np.argsort(codes).astype(np.intp)
 
     # BFS octree construction with LOD subsampling.
-    # At each internal node, keep a subsample of points for that LOD level
-    # and push the rest to child nodes.
     root_key = VoxelKey.from_values(0, 0, 0, 0)
-    all_indices = np.arange(n_points, dtype=np.intp)
-
     chunks = []
     queue = deque()
     queue.append((root_key, all_indices))
-
-    root_mins = center - halfsize
     max_depth_used = 0
 
     while queue:
@@ -97,43 +134,39 @@ def _build_octree(
         if len(indices) == 0:
             continue
 
-        if key.level >= max_depth:
-            # Leaf node: store all remaining points
+        if len(indices) <= target_points_per_node or key.level >= max_depth:
+            # Leaf node: remaining points fit within target — store all without further splitting.
             chunks.append(OctreeChunk(key=key, point_indices=indices))
             if key.level > max_depth_used:
                 max_depth_used = key.level
             continue
 
         # Internal node: voxel-occupancy subsampling.
-        # Divide the node into a _CELL_COUNT³ grid; keep the first point that
-        # lands in each occupied cell (after a random shuffle) and push the
-        # rest to children.  This produces back-loaded trees where the root
-        # holds a sparse, spatially uniform sample — matching PDAL's behaviour
-        # and enabling efficient progressive loading in Potree / web viewers.
+        # indices is Morton-ordered, so np.unique keeps the Morton-first point
+        # per cell — deterministic and spatially representative, no shuffle needed.
         node_side = (2.0 * halfsize) / (2 ** key.level)
-        node_min = root_mins + np.array([key.x, key.y, key.z], dtype=np.float64) * node_side
-        cell_w = node_side / _CELL_COUNT
+        node_min = root_min + np.array([key.x, key.y, key.z], dtype=np.float64) * node_side
+        cell_w = node_side / cell_count
 
-        gx = np.clip(((actual_x[indices] - node_min[0]) / cell_w).astype(np.int32), 0, _CELL_COUNT - 1)
-        gy = np.clip(((actual_y[indices] - node_min[1]) / cell_w).astype(np.int32), 0, _CELL_COUNT - 1)
-        gz = np.clip(((actual_z[indices] - node_min[2]) / cell_w).astype(np.int32), 0, _CELL_COUNT - 1)
-        grid_keys = (gx.astype(np.int64) * _CELL_COUNT + gy.astype(np.int64)) * _CELL_COUNT + gz.astype(np.int64)
+        gx = np.clip(((actual_x[indices] - node_min[0]) / cell_w).astype(np.int32), 0, cell_count - 1)
+        gy = np.clip(((actual_y[indices] - node_min[1]) / cell_w).astype(np.int32), 0, cell_count - 1)
+        gz = np.clip(((actual_z[indices] - node_min[2]) / cell_w).astype(np.int32), 0, cell_count - 1)
+        grid_keys = (gx.astype(np.int64) * cell_count + gy.astype(np.int64)) * cell_count + gz.astype(np.int64)
 
-        np.random.seed(key.level * 1000 + key.x * 100 + key.y * 10 + key.z)
-        perm = np.random.permutation(len(indices))
-        _, first_occ = np.unique(grid_keys[perm], return_index=True)
+        _, first_occ = np.unique(grid_keys, return_index=True)
 
         keep_mask = np.zeros(len(indices), dtype=bool)
         keep_mask[first_occ] = True
 
-        node_indices = indices[perm[first_occ]]
-        remaining_indices = indices[perm[~keep_mask]]
+        node_indices = indices[first_occ]
+        remaining_indices = indices[~keep_mask]  # Morton order preserved
 
         chunks.append(OctreeChunk(key=key, point_indices=node_indices))
         if key.level > max_depth_used:
             max_depth_used = key.level
 
-        # Partition remaining points into 8 children by octant
+        # Partition remaining (Morton-ordered) into 8 children by octant.
+        # Each child's subset is also Morton-ordered — no re-sort needed.
         node_center = node_min + node_side / 2.0
         px = actual_x[remaining_indices]
         py = actual_y[remaining_indices]
@@ -152,9 +185,7 @@ def _build_octree(
 
     chunks.sort(key=lambda c: (c.key.level, c.key.x, c.key.y, c.key.z))
 
-    # Spacing reflects the voxel cell width at the root — the minimum
-    # distance between points stored at LOD level 0.
-    spacing = (2.0 * halfsize) / _CELL_COUNT
+    spacing = (2.0 * halfsize) / cell_count
 
     return OctreeResult(
         chunks=chunks,
@@ -335,16 +366,31 @@ class CopcWriter:
 
         compressor.done()
 
-        # Write hierarchy page
-        hierarchy_offset = dest.tell()
-        for entry in entries:
-            dest.write(entry.to_bytes())
-        hierarchy_size = dest.tell() - hierarchy_offset
+        # Build hierarchy EVLR data (all entries concatenated)
+        entry_bytes = b"".join(e.to_bytes() for e in entries)
+
+        hierarchy_vlr = CopcHierarchyVlr()
+        hierarchy_vlr.data = entry_bytes
+
+        # Write hierarchy as a proper COPC EVLR at end of file.
+        # hierarchy_root_offset must point to the EVLR *data* (after the
+        # 60-byte EVLR header), matching the COPC spec and PDAL's convention.
+        _EVLR_HEADER_SIZE = 60
+        evlr_start = dest.tell()
+        hierarchy_root_offset = evlr_start + _EVLR_HEADER_SIZE
+        hierarchy_root_size = len(entry_bytes)
+
+        evlr_list = VLRList([hierarchy_vlr])
+        evlr_list.write_to(dest, as_extended=True)
 
         # Update CopcInfoVlr with actual hierarchy location
-        copc_info.hierarchy_root_offset = hierarchy_offset
-        copc_info.hierarchy_root_size = hierarchy_size
+        copc_info.hierarchy_root_offset = hierarchy_root_offset
+        copc_info.hierarchy_root_size = hierarchy_root_size
 
-        # Rewrite header with updated CopcInfoVlr
+        # Update header EVLR bookkeeping fields
+        header.start_of_first_evlr = evlr_start
+        header.number_of_evlrs = 1
+
+        # Rewrite header with updated CopcInfoVlr and EVLR fields
         dest.seek(0)
         header.write_to(dest, ensure_same_size=True)
