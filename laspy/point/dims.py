@@ -132,6 +132,15 @@ DIMENSIONS_TO_TYPE: Dict[str, np.dtype] = {
     "nir": np.dtype("u2"),
 }
 
+# Mapping of equivalent dimension pairs that were renamed between point format generations.
+# Key: (source_name, dest_name), Value: scale factor to apply when converting source -> dest.
+# The reverse direction uses 1/factor. This handles both the name change and unit conversion.
+# scan_angle_rank (formats 0-5): int8, whole degrees
+# scan_angle (formats 6-10): int16, 0.006 degree increments
+DIMENSION_CONVERSIONS: Dict[Tuple[str, str], float] = {
+    ("scan_angle_rank", "scan_angle"): 1.0 / 0.006,
+}
+
 POINT_FORMAT_0: Tuple[str, ...] = (
     "X",
     "Y",
