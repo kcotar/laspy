@@ -72,6 +72,14 @@ class LasWriter:
         except ValueError:
             pass
 
+        # Remove COPC-specific VLRs since this writer is for
+        # standard LAS/LAZ files, not COPC
+        for vlr_type in ("CopcInfoVlr", "CopcHierarchyVlr"):
+            try:
+                self.header.vlrs.pop(self.header.vlrs.index(vlr_type))
+            except ValueError:
+                pass
+
         if self.update_header:
             self.header.partial_reset()
 
