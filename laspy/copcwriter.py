@@ -77,49 +77,63 @@ def _build_octree(
     target_points_per_node: int = 100_000,
     max_depth: Optional[int] = None,
 ) -> OctreeResult:
-    x = np.asarray(points["X"], dtype=np.float64)
-    y = np.asarray(points["Y"], dtype=np.float64)
-    z = np.asarray(points["Z"], dtype=np.float64)
+    n_points = len(points)
+    sx, sy, sz = header.scales
+    ox, oy, oz = header.offsets
 
-    # Convert to actual coordinates for octree bounds
-    actual_x = x * header.scales[0] + header.offsets[0]
-    actual_y = y * header.scales[1] + header.offsets[1]
-    actual_z = z * header.scales[2] + header.offsets[2]
+    # --- Phase 1: Contiguous int32 copies for fast sequential access ---
+    # Used for bounds, morton codes, then freed before argsort to reduce peak.
+    int_x = np.ascontiguousarray(points["X"])
+    int_y = np.ascontiguousarray(points["Y"])
+    int_z = np.ascontiguousarray(points["Z"])
 
     mins = np.array(
-        [actual_x.min(), actual_y.min(), actual_z.min()], dtype=np.float64
+        [float(int_x.min()) * sx + ox, float(int_y.min()) * sy + oy, float(int_z.min()) * sz + oz],
+        dtype=np.float64,
     )
     maxs = np.array(
-        [actual_x.max(), actual_y.max(), actual_z.max()], dtype=np.float64
+        [float(int_x.max()) * sx + ox, float(int_y.max()) * sy + oy, float(int_z.max()) * sz + oz],
+        dtype=np.float64,
     )
 
     halfsize = float(np.max(maxs - mins)) / 2.0
     center = mins + halfsize
-
     if halfsize == 0.0:
         halfsize = 1.0
 
-    n_points = len(points)
     if max_depth is None:
-        # Safety cap only — the adaptive leaf criterion below drives actual depth.
-        # Matches PDAL: keep splitting until every leaf has <= target_points_per_node.
         max_depth = 20
 
-    # Adaptive cell count: scales with dataset size, matching PDAL's behaviour.
-    # floor(cbrt(N) * 2) gives ~147 for 411k points; minimum 128 for small files.
     cell_count = max(128, floor(n_points ** (1.0 / 3.0) * 2))
-
     root_min = center - halfsize
+    side = 2.0 * halfsize
 
-    # Pre-sort all points once by Morton (Z-order) code.
-    # This replaces the per-node random shuffle: the BFS passes Morton-ordered
-    # index arrays to children, so np.unique's first-occurrence selection is
-    # deterministic and spatially coherent — matching PDAL's behaviour without
-    # any per-node sort.  Morton order is preserved through octant splits
-    # because Z-order is locality-preserving: all points of a child octant
-    # appear contiguously (and in Z-order) within the parent's sorted range.
-    codes = _morton_codes(actual_x, actual_y, actual_z, root_min, 2.0 * halfsize)
-    all_indices = np.argsort(codes).astype(np.intp)
+    # --- Phase 2: Morton codes in 1M-point chunks ---
+    # Limits float64 temporaries to ~24 MB per chunk instead of ~240 MB for
+    # the full dataset.  int_x/y/z provide fast contiguous access.
+    codes = np.empty(n_points, dtype=np.uint64)
+    _CHUNK = 1_000_000
+    for start in range(0, n_points, _CHUNK):
+        end = min(start + _CHUNK, n_points)
+        sl = slice(start, end)
+        ax = int_x[sl].astype(np.float64) * sx + ox
+        ay = int_y[sl].astype(np.float64) * sy + oy
+        az = int_z[sl].astype(np.float64) * sz + oz
+        codes[sl] = _morton_codes(ax, ay, az, root_min, side)
+
+    # --- Phase 3: Sort — free int32 coords first to reduce argsort peak ---
+    del int_x, int_y, int_z
+    idx_dtype = np.int32 if n_points <= np.iinfo(np.int32).max else np.intp
+    all_indices = np.argsort(codes).astype(idx_dtype)
+    del codes
+
+    # --- Phase 4: Re-create contiguous int32 coords for BFS ---
+    int_x = np.ascontiguousarray(points["X"])
+    int_y = np.ascontiguousarray(points["Y"])
+    int_z = np.ascontiguousarray(points["Z"])
+
+    # Use int32 grid_keys when cell_count^3 fits, avoiding int64 conversions.
+    use_int32_grid = (cell_count ** 3) < np.iinfo(np.int32).max
 
     # BFS octree construction with LOD subsampling.
     root_key = VoxelKey.from_values(0, 0, 0, 0)
@@ -135,7 +149,6 @@ def _build_octree(
             continue
 
         if len(indices) <= target_points_per_node or key.level >= max_depth:
-            # Leaf node: remaining points fit within target — store all without further splitting.
             chunks.append(OctreeChunk(key=key, point_indices=indices))
             if key.level > max_depth_used:
                 max_depth_used = key.level
@@ -144,22 +157,45 @@ def _build_octree(
         # Internal node: voxel-occupancy subsampling.
         # indices is Morton-ordered, so np.unique keeps the Morton-first point
         # per cell — deterministic and spatially representative, no shuffle needed.
-        node_side = (2.0 * halfsize) / (2 ** key.level)
+        node_side = side / (2 ** key.level)
         node_min = root_min + np.array([key.x, key.y, key.z], dtype=np.float64) * node_side
         cell_w = node_side / cell_count
 
-        gx = np.clip(((actual_x[indices] - node_min[0]) / cell_w).astype(np.int32), 0, cell_count - 1)
-        gy = np.clip(((actual_y[indices] - node_min[1]) / cell_w).astype(np.int32), 0, cell_count - 1)
-        gz = np.clip(((actual_z[indices] - node_min[2]) / cell_w).astype(np.int32), 0, cell_count - 1)
-        grid_keys = (gx.astype(np.int64) * cell_count + gy.astype(np.int64)) * cell_count + gz.astype(np.int64)
+        # Build grid_keys incrementally, one axis at a time, freeing each
+        # grid-cell array before computing the next.  This avoids having
+        # gx + gy + gz + grid_keys all alive simultaneously.
+        node_min_ix = (node_min[0] - ox) / sx
+        cs_x = sx / cell_w
+        gx = np.clip(((int_x[indices] - node_min_ix) * cs_x).astype(np.int32), 0, cell_count - 1)
+        if use_int32_grid:
+            cc32 = np.int32(cell_count)
+            grid_keys = gx * cc32
+        else:
+            grid_keys = gx.astype(np.int64) * cell_count
+        del gx
+
+        node_min_iy = (node_min[1] - oy) / sy
+        cs_y = sy / cell_w
+        gy = np.clip(((int_y[indices] - node_min_iy) * cs_y).astype(np.int32), 0, cell_count - 1)
+        grid_keys += gy if use_int32_grid else gy.astype(np.int64)
+        del gy
+        grid_keys *= cc32 if use_int32_grid else cell_count
+
+        node_min_iz = (node_min[2] - oz) / sz
+        cs_z = sz / cell_w
+        gz = np.clip(((int_z[indices] - node_min_iz) * cs_z).astype(np.int32), 0, cell_count - 1)
+        grid_keys += gz if use_int32_grid else gz.astype(np.int64)
+        del gz
 
         _, first_occ = np.unique(grid_keys, return_index=True)
+        del grid_keys
 
         keep_mask = np.zeros(len(indices), dtype=bool)
         keep_mask[first_occ] = True
 
         node_indices = indices[first_occ]
         remaining_indices = indices[~keep_mask]  # Morton order preserved
+        del keep_mask
 
         chunks.append(OctreeChunk(key=key, point_indices=node_indices))
         if key.level > max_depth_used:
@@ -167,15 +203,15 @@ def _build_octree(
 
         # Partition remaining (Morton-ordered) into 8 children by octant.
         # Each child's subset is also Morton-ordered — no re-sort needed.
-        node_center = node_min + node_side / 2.0
-        px = actual_x[remaining_indices]
-        py = actual_y[remaining_indices]
-        pz = actual_z[remaining_indices]
+        # Compare in integer coordinate space to avoid float64 allocation.
+        node_center_ix = (node_min[0] + node_side / 2.0 - ox) / sx
+        node_center_iy = (node_min[1] + node_side / 2.0 - oy) / sy
+        node_center_iz = (node_min[2] + node_side / 2.0 - oz) / sz
 
         octant = (
-            (px >= node_center[0]).astype(np.uint8)
-            | ((py >= node_center[1]).astype(np.uint8) << 1)
-            | ((pz >= node_center[2]).astype(np.uint8) << 2)
+            (int_x[remaining_indices] >= node_center_ix).astype(np.uint8)
+            | ((int_y[remaining_indices] >= node_center_iy).astype(np.uint8) << 1)
+            | ((int_z[remaining_indices] >= node_center_iz).astype(np.uint8) << 2)
         )
 
         for direction in range(8):
@@ -184,8 +220,7 @@ def _build_octree(
                 queue.append((key.child(direction), child_indices))
 
     chunks.sort(key=lambda c: (c.key.level, c.key.x, c.key.y, c.key.z))
-
-    spacing = (2.0 * halfsize) / cell_count
+    spacing = side / cell_count
 
     return OctreeResult(
         chunks=chunks,
@@ -261,20 +296,17 @@ class CopcWriter:
         header.start_of_first_evlr = 0
         header.number_of_evlrs = 0
 
-        # Update bounds
+        # Update bounds (avoid float64 array allocation — use scalar min/max)
         if len(points) > 0:
-            x = np.asarray(points["X"], dtype=np.float64)
-            y = np.asarray(points["Y"], dtype=np.float64)
-            z = np.asarray(points["Z"], dtype=np.float64)
             header.maxs = [
-                float(x.max()) * header.scales[0] + header.offsets[0],
-                float(y.max()) * header.scales[1] + header.offsets[1],
-                float(z.max()) * header.scales[2] + header.offsets[2],
+                float(np.max(points["X"])) * header.scales[0] + header.offsets[0],
+                float(np.max(points["Y"])) * header.scales[1] + header.offsets[1],
+                float(np.max(points["Z"])) * header.scales[2] + header.offsets[2],
             ]
             header.mins = [
-                float(x.min()) * header.scales[0] + header.offsets[0],
-                float(y.min()) * header.scales[1] + header.offsets[1],
-                float(z.min()) * header.scales[2] + header.offsets[2],
+                float(np.min(points["X"])) * header.scales[0] + header.offsets[0],
+                float(np.min(points["Y"])) * header.scales[1] + header.offsets[1],
+                float(np.min(points["Z"])) * header.scales[2] + header.offsets[2],
             ]
 
             # Update number_of_points_by_return
@@ -337,20 +369,24 @@ class CopcWriter:
         chunk_start = offset_to_point_data + 8
         entries = []
 
-        point_bytes_array = np.frombuffer(points.array, dtype=np.uint8)
         point_size = header.point_format.size
+        # View point data as 2D array (n_points, point_size) — zero-copy reshape.
+        # Fancy indexing then copies only selected rows, avoiding the large
+        # byte_offsets matrix (which was n_pts × point_size × 8 bytes).
+        point_records_2d = np.frombuffer(points.array, dtype=np.uint8).reshape(-1, point_size)
 
         for chunk in octree.chunks:
             idx = chunk.point_indices
             n_pts = len(idx)
 
-            # Extract point bytes for this chunk
-            # Build byte indices for all points in this chunk
-            byte_offsets = (idx * point_size).reshape(-1, 1) + np.arange(point_size, dtype=np.intp)
-            chunk_bytes = point_bytes_array[byte_offsets.ravel()]
+            # Extract point bytes: copies only n_pts × point_size uint8 bytes.
+            chunk_bytes = point_records_2d[idx].ravel()
 
             compressor.compress_many(chunk_bytes)
             compressor.finish_current_chunk()
+
+            # Free chunk indices — no longer needed after compression.
+            chunk.point_indices = None
 
             chunk_end = dest.tell()
             byte_size = chunk_end - chunk_start
