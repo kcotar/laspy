@@ -689,13 +689,8 @@ class LasHeader:
         header.are_points_compressed = is_point_format_compressed(point_format_id)
         point_format_id = compressed_id_to_uncompressed(point_format_id)
         point_format = PointFormat(point_format_id)
-        try:
-            extra_bytes_vlr = typing.cast(
-                ExtraBytesVlr, header._vlrs.get("ExtraBytesVlr")[0]
-            )
-        except IndexError:
-            pass
-        else:
+        extra_bytes_vlrs = header._vlrs.get("ExtraBytesVlr")
+        if extra_bytes_vlrs:
             if point_size == point_format.size:
                 logger.warning(
                     "There is an ExtraByteVlr but the header.point_size matches the "
@@ -703,8 +698,14 @@ class LasHeader:
                 )
                 header._vlrs.extract("ExtraBytesVlr")
             else:
-                for extra_dim_info in extra_bytes_vlr.type_of_extra_dims():
-                    point_format.add_extra_dimension(extra_dim_info)
+                # LAS 1.4 files produced by multi-vendor pipelines (e.g. RIEGL +
+                # TerraScan) may carry more than one ExtraBytesVlr. Consume them
+                # all in order so every declared extra dimension is registered
+                # on the point format.
+                for eb_vlr in extra_bytes_vlrs:
+                    eb_vlr = typing.cast(ExtraBytesVlr, eb_vlr)
+                    for extra_dim_info in eb_vlr.type_of_extra_dims():
+                        point_format.add_extra_dimension(extra_dim_info)
         header._point_format = point_format
 
         if point_size > point_format.size:
