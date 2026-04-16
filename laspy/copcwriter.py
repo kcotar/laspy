@@ -314,6 +314,13 @@ class CopcWriter:
             return_numbers = np.asarray(points["return_number"])
             for rn in range(1, min(16, int(return_numbers.max()) + 1)):
                 header.number_of_points_by_return[rn - 1] = int(np.sum(return_numbers == rn))
+
+            # Update extra bytes min/max from actual point data
+            eb_vlrs = header.vlrs.get("ExtraBytesVlr")
+            if eb_vlrs:
+                for eb_vlr in eb_vlrs:
+                    eb_vlr.partial_reset()
+                    eb_vlr.grow(points)
         else:
             header.maxs = [0.0, 0.0, 0.0]
             header.mins = [0.0, 0.0, 0.0]
