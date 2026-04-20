@@ -1,9 +1,10 @@
 import io
 import logging
+import math
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
-from math import floor
+
 from typing import BinaryIO, List, Optional, Union
 
 import numpy as np
@@ -104,7 +105,13 @@ def _build_octree(
     if max_depth is None:
         max_depth = 20
 
-    cell_count = max(128, floor(n_points ** (1.0 / 3.0) * 2))
+    # Grid resolution calibrated to match PDAL/untwine LOD distribution.
+    # PDAL (bottom-up) uses base_spacing = side/128, grid_cell_width = spacing/sqrt(3).
+    # Our top-down approach needs a finer non-root grid (~222 cells) to capture
+    # enough points at each intermediate level, matching PDAL's output.
+    _PDAL_CELL_COUNT = math.ceil(128 * math.sqrt(3) / 1.5)  # 148
+    root_cell_count = _PDAL_CELL_COUNT
+    nonroot_cell_count = math.ceil(128 * math.sqrt(3))       # 222
     root_min = center - halfsize
     side = 2.0 * halfsize
 
@@ -133,7 +140,8 @@ def _build_octree(
     int_z = np.ascontiguousarray(points["Z"])
 
     # Use int32 grid_keys when cell_count^3 fits, avoiding int64 conversions.
-    use_int32_grid = (cell_count ** 3) < np.iinfo(np.int32).max
+    max_cc = max(root_cell_count, nonroot_cell_count)
+    use_int32_grid = (max_cc ** 3) < np.iinfo(np.int32).max
 
     # BFS octree construction with LOD subsampling.
     root_key = VoxelKey.from_values(0, 0, 0, 0)
@@ -148,15 +156,18 @@ def _build_octree(
         if len(indices) == 0:
             continue
 
-        if len(indices) <= target_points_per_node or key.level >= max_depth:
+        # At max_depth, store all remaining points as a leaf.
+        if key.level >= max_depth:
             chunks.append(OctreeChunk(key=key, point_indices=indices))
             if key.level > max_depth_used:
                 max_depth_used = key.level
             continue
 
-        # Internal node: voxel-occupancy subsampling.
+        # Voxel-occupancy subsampling: always subsample at every level
+        # (matching PDAL/untwine behaviour) to produce an even LOD distribution.
         # indices is Morton-ordered, so np.unique keeps the Morton-first point
         # per cell — deterministic and spatially representative, no shuffle needed.
+        cell_count = root_cell_count if key.level == 0 else nonroot_cell_count
         node_side = side / (2 ** key.level)
         node_min = root_min + np.array([key.x, key.y, key.z], dtype=np.float64) * node_side
         cell_w = node_side / cell_count
@@ -201,6 +212,10 @@ def _build_octree(
         if key.level > max_depth_used:
             max_depth_used = key.level
 
+        # If all points fit in unique cells, nothing left for children.
+        if len(remaining_indices) == 0:
+            continue
+
         # Partition remaining (Morton-ordered) into 8 children by octant.
         # Each child's subset is also Morton-ordered — no re-sort needed.
         # Compare in integer coordinate space to avoid float64 allocation.
@@ -214,13 +229,23 @@ def _build_octree(
             | ((int_z[remaining_indices] >= node_center_iz).astype(np.uint8) << 2)
         )
 
+        # When remaining points are few enough, make children leaf nodes
+        # directly (no further subdivision).  Otherwise enqueue for BFS.
+        make_leaves = len(remaining_indices) <= target_points_per_node
+
         for direction in range(8):
             child_indices = remaining_indices[octant == direction]
             if len(child_indices) > 0:
-                queue.append((key.child(direction), child_indices))
+                child_key = key.child(direction)
+                if make_leaves:
+                    chunks.append(OctreeChunk(key=child_key, point_indices=child_indices))
+                    if child_key.level > max_depth_used:
+                        max_depth_used = child_key.level
+                else:
+                    queue.append((child_key, child_indices))
 
     chunks.sort(key=lambda c: (c.key.level, c.key.x, c.key.y, c.key.z))
-    spacing = side / cell_count
+    spacing = side / _PDAL_CELL_COUNT
 
     return OctreeResult(
         chunks=chunks,

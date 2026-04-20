@@ -348,6 +348,14 @@ class DimensionInfo(NamedTuple):
     offsets: Optional[np.ndarray] = None
     scales: Optional[np.ndarray] = None
     no_data: Optional[np.ndarray] = None
+    # Optional reference to the parsed ``ExtraBytesStruct`` this dim was
+    # built from.  Non-None only for extras that came from parsing a
+    # file's ExtraBytesVlr.  Lets ``LasHeader._sync_extra_bytes_vlr``
+    # re-use the original on-disk bytes verbatim when re-serialising,
+    # preserving the original options byte (and any per-dim padding) that
+    # the constructor-and-``partial_reset`` path would otherwise overwrite.
+    # Typed as ``Any`` here to avoid a circular import with ``vlrs.known``.
+    source_struct: Optional[Any] = None
 
     @classmethod
     def from_extra_bytes_param(cls, params):

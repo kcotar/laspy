@@ -451,6 +451,14 @@ class ExtraBytesStruct(ctypes.LittleEndianStructure):
             raw_max[:] = v.astype(long_type)[:]
 
     def partial_reset(self):
+        # Only reset min/max slots when the original options byte declared
+        # them relevant.  Otherwise we'd rewrite the slots (which are
+        # expected to hold undefined bytes per the LAS spec when the bits
+        # aren't set) and lose the source file's bit-exact VLR content on
+        # a read→write round-trip.
+        if not self.min_is_relevant() and not self.max_is_relevant():
+            return
+
         long_type = self._long_type()
 
         if long_type == np.float64 or long_type == np.float32:
@@ -459,8 +467,10 @@ class ExtraBytesStruct(ctypes.LittleEndianStructure):
             info = np.iinfo(long_type)
 
         num_elements = self.num_elements()
-        np.frombuffer(self._min, dtype=long_type)[:num_elements] = info.max
-        np.frombuffer(self._max, dtype=long_type)[:num_elements] = info.min
+        if self.min_is_relevant():
+            np.frombuffer(self._min, dtype=long_type)[:num_elements] = info.max
+        if self.max_is_relevant():
+            np.frombuffer(self._max, dtype=long_type)[:num_elements] = info.min
 
     @staticmethod
     def size():
@@ -518,15 +528,20 @@ class ExtraBytesVlr(BaseKnownVLR):
                 else:
                     scales = np.array(scales[:num_elements])
 
-            dim_info_list.append(
-                ExtraBytesParams(
-                    eb_struct.format_name(),
-                    eb_struct.dtype(),
-                    description=eb_struct.description.rstrip(NULL_BYTE).decode(),
-                    scales=scales,
-                    offsets=offsets,
-                )
+            params = ExtraBytesParams(
+                eb_struct.format_name(),
+                eb_struct.dtype(),
+                description=eb_struct.description.rstrip(NULL_BYTE).decode(),
+                scales=scales,
+                offsets=offsets,
             )
+            # Carry the parsed struct through so the header can re-emit the
+            # original on-disk bytes verbatim on re-write, instead of going
+            # through the lossy ``ExtraBytesStruct(...)`` constructor path
+            # (which unconditionally sets MIN_BIT/MAX_BIT and fills the
+            # ``_min``/``_max`` slots with sentinel bytes via ``partial_reset``).
+            params.source_struct = eb_struct
+            dim_info_list.append(params)
         return dim_info_list
 
     def grow(self, points: PackedPointRecord):

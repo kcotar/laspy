@@ -38,6 +38,8 @@ def test_convert_1_5_write_read_las():
 
 @pytest.mark.parametrize("laz_backend", laspy.LazBackend.detect_available())
 def test_convert_1_5_write_read_laz(laz_backend):
+    if laz_backend == laspy.LazBackend.Laszip:
+        pytest.skip("laszip C library does not support LAS 1.5")
     las = laspy.read("tests/data/simple.las")
 
     for fmt in range(6):

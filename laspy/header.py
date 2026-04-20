@@ -978,10 +978,16 @@ class LasHeader:
         return header_bytes + rest
 
     def _sync_extra_bytes_vlr(self) -> None:
-        try:
-            self._vlrs.extract("ExtraBytesVlr")
-        except IndexError:
-            pass
+        # Drop any existing ExtraBytesVlr — we'll rebuild it from the current
+        # point_format's extras.  For each extra dim, prefer the original
+        # on-disk ``ExtraBytesStruct`` (carried on ``DimensionInfo.source_struct``
+        # when the dim came from a parsed file) so the options byte and
+        # per-dim padding round-trip byte-for-byte.  Rebuilding via the
+        # ``ExtraBytesStruct(...)`` constructor is lossy: it unconditionally
+        # sets MIN_BIT/MAX_BIT and fills ``_min``/``_max`` with sentinel
+        # bytes via ``partial_reset``, which rewrites extras whose source
+        # options byte was 0 ("not declared") to claim bogus min/max values.
+        self._vlrs.extract("ExtraBytesVlr")
 
         extra_dimensions = list(self.point_format.extra_dimensions)
         if not extra_dimensions:
@@ -996,6 +1002,21 @@ class LasHeader:
                 data_type = (0, extra_dimension.num_elements)
             else:
                 data_type = extradims.get_id_for_extra_dim_type(dtype)
+
+            source_struct = getattr(extra_dimension, "source_struct", None)
+            expected_data_type = (
+                data_type if isinstance(data_type, int) else data_type[0]
+            )
+            # Re-use the parsed struct when the dim still matches the
+            # original definition (name + data_type); fall through to a
+            # fresh build if the user has renamed/retyped it.
+            if (
+                source_struct is not None
+                and source_struct.name.rstrip(b"\x00") == extra_dimension.name.encode()
+                and source_struct.data_type == expected_data_type
+            ):
+                eb_vlr.extra_bytes_structs.append(source_struct)
+                continue
 
             eb_struct = ExtraBytesStruct(
                 name=extra_dimension.name.encode(),
