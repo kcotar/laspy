@@ -420,13 +420,26 @@ class ExtraBytesStruct(ctypes.LittleEndianStructure):
         local_max = np.zeros(num_elements, dtype=long_type)
 
         for i in range(num_elements):
+            # For a 1-element extra dim, pts is 1D (shape (N,)); for multi-element
+            # dims it is 2D (shape (N, num_elements)).  Index uniformly by column.
+            col = pts if num_elements == 1 else pts[..., i]
+
             if no_data is not None:
-                valid_indices = pts[..., i] != no_data[i]
-                if valid_indices.ndim == 0:
-                    return
-                sub_pts = pts[valid_indices, i]
+                valid_indices = col != no_data[i]
+                sub_pts = col[valid_indices]
             else:
-                sub_pts = pts[..., i]
+                sub_pts = col
+
+            if len(sub_pts) == 0:
+                # Every point is no_data for this element — we have nothing
+                # to compute min/max from.  Clear the relevance bits so the
+                # sentinel bytes left by ``partial_reset`` aren't interpreted
+                # as a real min/max by readers (e.g. copc.js parses the raw
+                # 8 bytes as BigInt, which chokes on 0xFFFFFFFFFFFFFFFF).
+                self.options &= ~(self.MIN_BIT_MASK | self.MAX_BIT_MASK)
+                ctypes.memset(self._min, 0, ctypes.sizeof(self._min))
+                ctypes.memset(self._max, 0, ctypes.sizeof(self._max))
+                return
 
             if self.min_is_relevant():
                 if isinstance(sub_pts, ScaledArrayView):
