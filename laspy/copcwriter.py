@@ -407,7 +407,8 @@ class CopcWriter:
         # byte_offsets matrix (which was n_pts × point_size × 8 bytes).
         point_records_2d = np.frombuffer(points.array, dtype=np.uint8).reshape(-1, point_size)
 
-        for chunk in octree.chunks:
+        last_idx = len(octree.chunks) - 1
+        for i, chunk in enumerate(octree.chunks):
             idx = chunk.point_indices
             n_pts = len(idx)
 
@@ -415,24 +416,39 @@ class CopcWriter:
             chunk_bytes = point_records_2d[idx].ravel()
 
             compressor.compress_many(chunk_bytes)
-            compressor.finish_current_chunk()
+            # Skip finish_current_chunk on the final chunk: done() finalizes it.
+            # Calling both produces a phantom empty chunk in the LAZ chunk table
+            # (n_chunks = real + 1), which breaks LASzip C++ readers (CloudCompare).
+            if i != last_idx:
+                compressor.finish_current_chunk()
 
             # Free chunk indices — no longer needed after compression.
             chunk.point_indices = None
 
-            chunk_end = dest.tell()
-            byte_size = chunk_end - chunk_start
-
             entry = Entry()
             entry.key = chunk.key
             entry.offset = chunk_start
-            entry.byte_size = byte_size
             entry.point_count = n_pts
+            # byte_size for non-last chunks: end position - start. Last chunk
+            # is backfilled after done() from the chunk table offset.
+            if i != last_idx:
+                chunk_end = dest.tell()
+                entry.byte_size = chunk_end - chunk_start
+                chunk_start = chunk_end
+            else:
+                entry.byte_size = 0
             entries.append(entry)
 
-            chunk_start = chunk_end
-
         compressor.done()
+
+        # Last chunk ends where the chunk table starts. lazrs wrote the chunk
+        # table offset into the 8-byte placeholder at offset_to_point_data.
+        if entries:
+            saved_pos = dest.tell()
+            dest.seek(offset_to_point_data)
+            chunk_table_offset = int.from_bytes(dest.read(8), "little", signed=True)
+            dest.seek(saved_pos)
+            entries[-1].byte_size = chunk_table_offset - entries[-1].offset
 
         # Build hierarchy EVLR data (all entries concatenated)
         entry_bytes = b"".join(e.to_bytes() for e in entries)
