@@ -74,9 +74,7 @@ class LazrsPointReader(IPointReader):
         self._source = source
         self.vlr = lazrs.LazVlr(laszip_vlr.record_data)
         selection = decompression_selection.to_lazrs()
-        # Variable-size chunks (used by COPC) are not supported by the parallel
-        # decompressor — fall back to serial in that case.
-        if parallel and not self.vlr.uses_variable_size_chunks():
+        if parallel:
             self.decompressor = lazrs.ParLasZipDecompressor(
                 source, laszip_vlr.record_data, selection
             )
