@@ -998,7 +998,24 @@ class LasHeader:
             dtype = extra_dimension.dtype
             assert dtype is not None
 
-            if extra_dimension.num_elements > 3 and dtype.base == np.uint8:
+            # LAS 1.4 R14 deprecated array data_types 11-30 (e.g. 11 = uint8[2],
+            # 21 = uint8[3]). Strict readers like copc.js / Potree reject them.
+            # Collapse to raw bytes (data_type=0 + options=size_in_bytes) when
+            # the dim is plain uint8 with no typed-value semantics (no scale,
+            # offset, or no_data) — this covers the auto-generated
+            # "Un-registered ExtraBytes" path. User-defined arrays that carry
+            # scale/offset/no_data metadata are preserved as the typed array,
+            # since collapsing them would silently lose that metadata.
+            has_typed_metadata = (
+                extra_dimension.scales is not None
+                or extra_dimension.offsets is not None
+                or extra_dimension.no_data is not None
+            )
+            if (
+                extra_dimension.num_elements > 1
+                and dtype.base == np.uint8
+                and not has_typed_metadata
+            ):
                 data_type = (0, extra_dimension.num_elements)
             else:
                 data_type = extradims.get_id_for_extra_dim_type(dtype)

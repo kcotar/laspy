@@ -364,6 +364,40 @@ def test_handle_unregistered_extra_bytes():
     check_file(las)
 
 
+@pytest.mark.parametrize("num_extra_bytes", [2, 3, 4, 5])
+def test_unregistered_extra_bytes_use_data_type_zero(num_extra_bytes):
+    # When unregistered extra bytes get materialized into an ExtraBytesVlr
+    # (e.g. via laspy.convert), the resulting struct must use data_type=0
+    # with options=size_in_bytes. The deprecated array data_types 11-30
+    # (e.g. 11 = uint8[2]) are rejected by strict readers like copc.js.
+    from laspy.point import dims
+    from laspy.vlrs.known import ExtraBytesVlr
+
+    header = laspy.LasHeader(point_format=6, version="1.4")
+    # Simulate the read-time auto-generation of "Un-registered ExtraBytes"
+    header.point_format.dimensions.append(
+        dims.DimensionInfo(
+            name="ExtraBytes",
+            kind=dims.DimensionKind.UnsignedInteger,
+            num_bits=8 * num_extra_bytes,
+            num_elements=num_extra_bytes,
+            is_standard=False,
+            description="Un-registered ExtraBytes",
+        )
+    )
+    header._sync_extra_bytes_vlr()
+
+    eb_vlrs = [v for v in header.vlrs if isinstance(v, ExtraBytesVlr)]
+    assert len(eb_vlrs) == 1
+    structs = eb_vlrs[0].extra_bytes_structs
+    assert len(structs) == 1
+    assert structs[0].data_type == 0, (
+        f"data_type must be 0 (raw bytes) for {num_extra_bytes}-byte unregistered "
+        f"extras; got {structs[0].data_type} (deprecated array type)"
+    )
+    assert structs[0].options == num_extra_bytes
+
+
 def test_remove_standard_dimension_fails():
     """
     Test we cannot remove non-extra dimension
