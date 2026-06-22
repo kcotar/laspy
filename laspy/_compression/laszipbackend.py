@@ -1,3 +1,4 @@
+import ctypes
 import io
 from typing import Any, BinaryIO, Optional
 
@@ -121,16 +122,56 @@ class LaszipPointWriter(IPointWriter):
         # Do nothing as creating the laszip zipper writes the header and vlrs
         pass
 
+    @staticmethod
+    def _copy_extra_bytes_min_max(src_vlr, dst_vlr) -> None:
+        # Copy the data-derived min/max (and the no_data / options metadata that
+        # goes with them) from the in-memory, already-grown ExtraBytes structs
+        # onto the structs parsed from disk. Matched by name so it is robust to
+        # ordering differences; the byte layout of the special-property slots is
+        # identical between the two, so a raw memmove is safe and size-preserving.
+        src_by_name = {st.format_name(): st for st in src_vlr.extra_bytes_structs}
+        for dst_st in dst_vlr.extra_bytes_structs:
+            src_st = src_by_name.get(dst_st.format_name())
+            if src_st is None:
+                continue
+            dst_st.options = src_st.options
+            for slot in ("_min", "_max", "_no_data"):
+                ctypes.memmove(
+                    ctypes.addressof(getattr(dst_st, slot)),
+                    ctypes.addressof(getattr(src_st, slot)),
+                    ctypes.sizeof(getattr(dst_st, slot)),
+                )
+
     def write_updated_header(self, header: LasHeader, encoding_errors: str) -> None:
+        # The laszip zipper serialised the header + VLRs when this writer was
+        # constructed -- before the point stream let ``grow()`` compute the real
+        # ExtraBytes min/max -- so the on-disk ExtraBytes VLR still holds the
+        # ``partial_reset`` sentinels (which viewers read as bogus values such as
+        # -0.01 / 0). Unlike the lazrs backends (which re-emit the whole header on
+        # update), this writer only patched EVLR offsets. Re-read the on-disk
+        # header (it also carries the LASzip VLR the zipper added, absent from
+        # ``header``) and copy over the grown ExtraBytes min/max as well, then
+        # rewrite it at the same size.
+        in_mem_eb = header.vlrs.get("ExtraBytesVlr")
+
+        if header.number_of_evlrs == 0 and not in_mem_eb:
+            return
+
+        self.dest.seek(0, io.SEEK_SET)
+        file_header = LasHeader.read_from(self.dest)
+        end_of_header_pos = self.dest.tell()
+
         if header.number_of_evlrs != 0:
-            # We wrote some evlrs, we have to update the header
-            self.dest.seek(0, io.SEEK_SET)
-            file_header = LasHeader.read_from(self.dest)
-            end_of_header_pos = self.dest.tell()
             file_header.number_of_evlrs = header.number_of_evlrs
             file_header.start_of_first_evlr = header.start_of_first_evlr
-            self.dest.seek(0, io.SEEK_SET)
-            file_header.write_to(
-                self.dest, ensure_same_size=True, encoding_errors=encoding_errors
-            )
-            assert self.dest.tell() == end_of_header_pos
+
+        if in_mem_eb:
+            file_eb = file_header.vlrs.get("ExtraBytesVlr")
+            if file_eb:
+                self._copy_extra_bytes_min_max(in_mem_eb[0], file_eb[0])
+
+        self.dest.seek(0, io.SEEK_SET)
+        file_header.write_to(
+            self.dest, ensure_same_size=True, encoding_errors=encoding_errors
+        )
+        assert self.dest.tell() == end_of_header_pos
