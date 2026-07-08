@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 _MORTON_BITS = 21                        # bits per dimension in Morton code
 _MORTON_MAX  = (1 << _MORTON_BITS) - 1  # 2097151
 
+# Grid resolution calibrated to match PDAL/untwine LOD distribution.
+# PDAL (bottom-up) uses base_spacing = side/128, grid_cell_width = spacing/sqrt(3).
+_PDAL_CELL_COUNT = math.ceil(128 * math.sqrt(3) / 1.5)  # 148
+
 
 def _spread_bits(v: np.ndarray) -> np.ndarray:
     """Spread 21-bit integers to every 3rd bit position for 63-bit Morton encoding."""
@@ -82,6 +86,22 @@ def _build_octree(
     sx, sy, sz = header.scales
     ox, oy, oz = header.offsets
 
+    if n_points == 0:
+        # Empty input: still emit the mandatory "0-0-0-0" root node so the
+        # hierarchy is valid COPC; bounds degenerate to a unit cube at origin.
+        return OctreeResult(
+            chunks=[
+                OctreeChunk(
+                    key=VoxelKey.from_values(0, 0, 0, 0),
+                    point_indices=np.empty(0, dtype=np.int32),
+                )
+            ],
+            intermediate_keys=[],
+            center=np.zeros(3, dtype=np.float64),
+            halfsize=1.0,
+            spacing=2.0 / _PDAL_CELL_COUNT,
+        )
+
     # --- Phase 1: Contiguous int32 copies for fast sequential access ---
     # Used for bounds, morton codes, then freed before argsort to reduce peak.
     int_x = np.ascontiguousarray(points["X"])
@@ -105,11 +125,8 @@ def _build_octree(
     if max_depth is None:
         max_depth = 20
 
-    # Grid resolution calibrated to match PDAL/untwine LOD distribution.
-    # PDAL (bottom-up) uses base_spacing = side/128, grid_cell_width = spacing/sqrt(3).
     # Our top-down approach needs a finer non-root grid (~222 cells) to capture
     # enough points at each intermediate level, matching PDAL's output.
-    _PDAL_CELL_COUNT = math.ceil(128 * math.sqrt(3) / 1.5)  # 148
     root_cell_count = _PDAL_CELL_COUNT
     nonroot_cell_count = math.ceil(128 * math.sqrt(3))       # 222
     root_min = center - halfsize
@@ -362,7 +379,7 @@ class CopcWriter:
         copc_info.hierarchy_root_size = 0
 
         # Set GPS time bounds if available
-        if "gps_time" in points.point_format.dimension_names:
+        if "gps_time" in points.point_format.dimension_names and len(points) > 0:
             gps = np.asarray(points["gps_time"])
             copc_info.gps_min = float(gps.min())
             copc_info.gps_max = float(gps.max())
