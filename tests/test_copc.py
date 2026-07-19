@@ -301,3 +301,159 @@ def test_copc_selective_decompression(backend):
         != fully_decompressed_points.point_source_id
     )
     assert np.any(partially_decompressed_points.Z != fully_decompressed_points.Z)
+
+
+@pytest.mark.skipif("not laspy.LazBackend.Lazrs.is_available()")
+@pytest.mark.parametrize(
+    "copc_file",
+    [SIMPLE_COPC_FILE, SIMPLE_COPC_FILE.with_name("simple_with_page.copc.laz")],
+)
+def test_copc_edit_rewrite_reuses_octree(copc_file, monkeypatch):
+    # Editing attributes of a COPC file and re-writing it as COPC
+    # must reuse the source octree structure instead of rebuilding it.
+    import laspy.copcwriter as copcwriter
+
+    def fail_build(*args, **kwargs):
+        raise AssertionError("octree should not be rebuilt for attribute edits")
+
+    monkeypatch.setattr(copcwriter, "_build_octree", fail_build)
+
+    las = laspy.read(copc_file)
+    original_x = np.array(las.X)
+    las.classification[:] = 7
+
+    output = io.BytesIO()
+    laspy.CopcWriter.write(output, las.header, las.points)
+    data = output.getvalue()
+
+    # Data round-trips: same points in the same order, only classification changed
+    back = laspy.read(io.BytesIO(data))
+    assert np.array_equal(np.array(back.X), original_x)
+    assert np.all(np.array(back.classification) == 7)
+
+    # The rewritten file is a valid COPC with the same hierarchy
+    with laspy.CopcReader.open(copc_file) as source_reader:
+        source_entries = {
+            (k.level, k.x, k.y, k.z): e.point_count
+            for k, e in source_reader.root_page.entries.items()
+            if e.point_count != -1
+        }
+    with laspy.CopcReader(io.BytesIO(data)) as reader:
+        assert len(reader.query()) == len(las)
+        rewritten_entries = {
+            (k.level, k.x, k.y, k.z): e.point_count
+            for k, e in reader.root_page.entries.items()
+        }
+    # rewritten hierarchy is a single page containing at least all
+    # point-bearing entries of the source root page
+    for key, count in source_entries.items():
+        assert rewritten_entries[key] == count
+
+
+@pytest.mark.skipif("not laspy.LazBackend.Lazrs.is_available()")
+def test_copc_edit_rewrite_rebuilds_when_points_moved(monkeypatch):
+    # Coordinate edits that move points outside their octree nodes
+    # must fall back to a full octree rebuild.
+    import laspy.copcwriter as copcwriter
+
+    build_calls = []
+    original_build = copcwriter._build_octree
+
+    def counting_build(*args, **kwargs):
+        build_calls.append(1)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(copcwriter, "_build_octree", counting_build)
+
+    las = laspy.read(SIMPLE_COPC_FILE)
+    span = int(
+        (las.header.maxs[0] - las.header.mins[0]) / las.header.scales[0]
+    )
+    las.X = np.asarray(las.X) + 4 * span
+
+    output = io.BytesIO()
+    laspy.CopcWriter.write(output, las.header, las.points)
+    assert build_calls, "moving points must trigger an octree rebuild"
+
+    with laspy.CopcReader(io.BytesIO(output.getvalue())) as reader:
+        assert len(reader.query()) == len(las)
+
+
+@pytest.mark.skipif("not laspy.LazBackend.Lazrs.is_available()")
+def test_copc_edit_rewrite_reuse_with_added_extra_dim(monkeypatch):
+    # Adding an extra dimension keeps point count and order, so the
+    # source octree must still be reused and the new dim round-trips.
+    import laspy.copcwriter as copcwriter
+
+    def fail_build(*args, **kwargs):
+        raise AssertionError("octree should not be rebuilt when adding a dim")
+
+    monkeypatch.setattr(copcwriter, "_build_octree", fail_build)
+
+    las = laspy.read(SIMPLE_COPC_FILE)
+    las.add_extra_dim(laspy.ExtraBytesParams(name="instance_id", type="i4"))
+    ids = np.arange(len(las), dtype=np.int32)
+    las.instance_id = ids
+
+    output = io.BytesIO()
+    laspy.CopcWriter.write(output, las.header, las.points)
+
+    back = laspy.read(io.BytesIO(output.getvalue()))
+    assert "instance_id" in back.point_format.extra_dimension_names
+    assert np.array_equal(np.asarray(back.instance_id), ids)
+
+
+@pytest.mark.skipif("not laspy.LazBackend.Lazrs.is_available()")
+def test_copc_edit_rewrite_rebuilds_on_count_preserving_reorder(monkeypatch):
+    # Reordering points keeps the point count, so only the per-chunk
+    # containment check can detect that the source octree is no longer
+    # valid. It must trigger a rebuild (on a multi-chunk file).
+    import laspy.copcwriter as copcwriter
+
+    build_calls = []
+    original_build = copcwriter._build_octree
+
+    def counting_build(*args, **kwargs):
+        build_calls.append(1)
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(copcwriter, "_build_octree", counting_build)
+
+    las = laspy.read(SIMPLE_COPC_FILE)
+    order = np.argsort(np.asarray(las.gps_time), kind="stable")
+    assert not np.array_equal(order, np.arange(len(las)))
+    reordered = las[order]
+
+    output = io.BytesIO()
+    laspy.CopcWriter.write(output, reordered.header, reordered.points)
+    assert build_calls, "count-preserving reorder must trigger a rebuild"
+
+    with laspy.CopcReader(io.BytesIO(output.getvalue())) as reader:
+        assert len(reader.query()) == len(las)
+
+
+@pytest.mark.skipif("not laspy.LazBackend.Lazrs.is_available()")
+def test_copc_parallel_and_sequential_writes_are_equivalent(monkeypatch):
+    import laspy.copcwriter as copcwriter
+
+    assert copcwriter._HAS_PARALLEL_CHUNKS, "lazrs is expected to support compress_chunks"
+
+    las = laspy.read(SIMPLE_COPC_FILE)
+    las.classification[:] = 3
+
+    parallel_out = io.BytesIO()
+    laspy.CopcWriter.write(parallel_out, las.header, las.points)
+
+    monkeypatch.setattr(copcwriter, "_HAS_PARALLEL_CHUNKS", False)
+    las = laspy.read(SIMPLE_COPC_FILE)
+    las.classification[:] = 3
+    sequential_out = io.BytesIO()
+    laspy.CopcWriter.write(sequential_out, las.header, las.points)
+
+    # Same compressor, same chunk boundaries -> byte-identical files
+    assert parallel_out.getvalue() == sequential_out.getvalue()
+
+    with laspy.CopcReader(io.BytesIO(parallel_out.getvalue())) as reader:
+        points = reader.query()
+        assert len(points) == len(las)
+        assert np.all(np.asarray(points.classification) == 3)
