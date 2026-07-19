@@ -430,3 +430,30 @@ def test_copc_edit_rewrite_rebuilds_on_count_preserving_reorder(monkeypatch):
 
     with laspy.CopcReader(io.BytesIO(output.getvalue())) as reader:
         assert len(reader.query()) == len(las)
+
+
+@pytest.mark.skipif("not laspy.LazBackend.Lazrs.is_available()")
+def test_copc_parallel_and_sequential_writes_are_equivalent(monkeypatch):
+    import laspy.copcwriter as copcwriter
+
+    assert copcwriter._HAS_PARALLEL_CHUNKS, "lazrs is expected to support compress_chunks"
+
+    las = laspy.read(SIMPLE_COPC_FILE)
+    las.classification[:] = 3
+
+    parallel_out = io.BytesIO()
+    laspy.CopcWriter.write(parallel_out, las.header, las.points)
+
+    monkeypatch.setattr(copcwriter, "_HAS_PARALLEL_CHUNKS", False)
+    las = laspy.read(SIMPLE_COPC_FILE)
+    las.classification[:] = 3
+    sequential_out = io.BytesIO()
+    laspy.CopcWriter.write(sequential_out, las.header, las.points)
+
+    # Same compressor, same chunk boundaries -> byte-identical files
+    assert parallel_out.getvalue() == sequential_out.getvalue()
+
+    with laspy.CopcReader(io.BytesIO(parallel_out.getvalue())) as reader:
+        points = reader.query()
+        assert len(points) == len(las)
+        assert np.all(np.asarray(points.classification) == 3)

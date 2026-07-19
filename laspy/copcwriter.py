@@ -23,6 +23,15 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(__name__)
 
+# Parallel per-chunk compression needs lazrs APIs added in recent versions.
+_HAS_PARALLEL_CHUNKS = lazrs is not None and hasattr(
+    getattr(lazrs, "ParLasZipCompressor", None), "compress_chunks"
+) and hasattr(lazrs, "read_chunk_table")
+
+# Chunks compressed per compress_chunks call. Bounds transient memory to
+# ~one batch of compressed chunks while keeping all cores busy.
+_PARALLEL_CHUNK_BATCH = 32
+
 _MORTON_BITS = 21                        # bits per dimension in Morton code
 _MORTON_MAX  = (1 << _MORTON_BITS) - 1  # 2097151
 
@@ -464,6 +473,120 @@ class CopcWriter:
             )
 
     @staticmethod
+    def _compress_chunks_parallel(
+        dest: BinaryIO,
+        laz_vlr,
+        chunks: List[OctreeChunk],
+        point_records_2d: np.ndarray,
+        offset_to_point_data: int,
+    ) -> List[Entry]:
+        """Compress octree chunks on all cores via ParLasZipCompressor.
+
+        Each buffer passed to compress_chunks becomes exactly one LAZ chunk;
+        chunks are fed in batches so at most one batch of compressed chunks
+        is held in memory. Per-chunk byte sizes are recovered from the chunk
+        table that done() writes.
+        """
+        compressor = lazrs.ParLasZipCompressor(dest, laz_vlr)
+        # After compressor init, it writes 8-byte chunk table offset placeholder
+        # First chunk starts at offset_to_point_data + 8
+        for start in range(0, len(chunks), _PARALLEL_CHUNK_BATCH):
+            batch = chunks[start : start + _PARALLEL_CHUNK_BATCH]
+            # Slices (reuse path) stay zero-copy views; index arrays
+            # (rebuild path) copy only this batch's rows.
+            compressor.compress_chunks(
+                [point_records_2d[c.point_indices].ravel() for c in batch]
+            )
+            for chunk in batch:
+                chunk.point_indices = None
+        compressor.done()
+        end_of_data = dest.tell()
+
+        dest.seek(offset_to_point_data)
+        chunk_table = lazrs.read_chunk_table(dest, laz_vlr)
+        dest.seek(end_of_data)
+        if chunk_table is None or len(chunk_table) != len(chunks):
+            raise LaspyException(
+                "Chunk table inconsistent after parallel COPC compression "
+                f"({None if chunk_table is None else len(chunk_table)} entries "
+                f"for {len(chunks)} chunks)"
+            )
+
+        entries = []
+        chunk_start = offset_to_point_data + 8
+        for chunk, (point_count, byte_size) in zip(chunks, chunk_table):
+            entry = Entry()
+            entry.key = chunk.key
+            entry.offset = chunk_start
+            entry.byte_size = int(byte_size)
+            entry.point_count = int(point_count)
+            entries.append(entry)
+            chunk_start += int(byte_size)
+        return entries
+
+    @staticmethod
+    def _compress_chunks_sequential(
+        dest: BinaryIO,
+        laz_vlr,
+        chunks: List[OctreeChunk],
+        point_records_2d: np.ndarray,
+        offset_to_point_data: int,
+    ) -> List[Entry]:
+        """Single-threaded fallback for lazrs versions without compress_chunks
+        (also handles the 0-point file, whose single empty chunk the parallel
+        API is not exercised with)."""
+        compressor = lazrs.LasZipCompressor(dest, laz_vlr)
+        # After compressor init, it writes 8-byte chunk table offset placeholder
+        # First chunk starts at offset_to_point_data + 8
+
+        chunk_start = offset_to_point_data + 8
+        entries = []
+
+        last_idx = len(chunks) - 1
+        for i, chunk in enumerate(chunks):
+            idx = chunk.point_indices
+            n_pts = (idx.stop - idx.start) if isinstance(idx, slice) else len(idx)
+
+            # Extract point bytes: copies only n_pts × point_size uint8 bytes.
+            chunk_bytes = point_records_2d[idx].ravel()
+
+            compressor.compress_many(chunk_bytes)
+            # Skip finish_current_chunk on the final chunk: done() finalizes it.
+            # Calling both produces a phantom empty chunk in the LAZ chunk table
+            # (n_chunks = real + 1), which breaks LASzip C++ readers (CloudCompare).
+            if i != last_idx:
+                compressor.finish_current_chunk()
+
+            # Free chunk indices — no longer needed after compression.
+            chunk.point_indices = None
+
+            entry = Entry()
+            entry.key = chunk.key
+            entry.offset = chunk_start
+            entry.point_count = n_pts
+            # byte_size for non-last chunks: end position - start. Last chunk
+            # is backfilled after done() from the chunk table offset.
+            if i != last_idx:
+                chunk_end = dest.tell()
+                entry.byte_size = chunk_end - chunk_start
+                chunk_start = chunk_end
+            else:
+                entry.byte_size = 0
+            entries.append(entry)
+
+        compressor.done()
+
+        # Last chunk ends where the chunk table starts. lazrs wrote the chunk
+        # table offset into the 8-byte placeholder at offset_to_point_data.
+        if entries:
+            saved_pos = dest.tell()
+            dest.seek(offset_to_point_data)
+            chunk_table_offset = int.from_bytes(dest.read(8), "little", signed=True)
+            dest.seek(saved_pos)
+            entries[-1].byte_size = chunk_table_offset - entries[-1].offset
+        return entries
+
+    @staticmethod
     def _write_copc(
         dest: BinaryIO,
         header: LasHeader,
@@ -563,61 +686,20 @@ class CopcWriter:
         offset_to_point_data = header.offset_to_point_data
 
         # Write compressed chunks
-        compressor = lazrs.LasZipCompressor(dest, laz_vlr)
-        # After compressor init, it writes 8-byte chunk table offset placeholder
-        # First chunk starts at offset_to_point_data + 8
-
-        chunk_start = offset_to_point_data + 8
-        entries = []
-
         point_size = header.point_format.size
         # View point data as 2D array (n_points, point_size) — zero-copy reshape.
         # Fancy indexing then copies only selected rows, avoiding the large
         # byte_offsets matrix (which was n_pts × point_size × 8 bytes).
         point_records_2d = np.frombuffer(points.array, dtype=np.uint8).reshape(-1, point_size)
 
-        last_idx = len(octree.chunks) - 1
-        for i, chunk in enumerate(octree.chunks):
-            idx = chunk.point_indices
-            n_pts = (idx.stop - idx.start) if isinstance(idx, slice) else len(idx)
-
-            # Extract point bytes: copies only n_pts × point_size uint8 bytes.
-            chunk_bytes = point_records_2d[idx].ravel()
-
-            compressor.compress_many(chunk_bytes)
-            # Skip finish_current_chunk on the final chunk: done() finalizes it.
-            # Calling both produces a phantom empty chunk in the LAZ chunk table
-            # (n_chunks = real + 1), which breaks LASzip C++ readers (CloudCompare).
-            if i != last_idx:
-                compressor.finish_current_chunk()
-
-            # Free chunk indices — no longer needed after compression.
-            chunk.point_indices = None
-
-            entry = Entry()
-            entry.key = chunk.key
-            entry.offset = chunk_start
-            entry.point_count = n_pts
-            # byte_size for non-last chunks: end position - start. Last chunk
-            # is backfilled after done() from the chunk table offset.
-            if i != last_idx:
-                chunk_end = dest.tell()
-                entry.byte_size = chunk_end - chunk_start
-                chunk_start = chunk_end
-            else:
-                entry.byte_size = 0
-            entries.append(entry)
-
-        compressor.done()
-
-        # Last chunk ends where the chunk table starts. lazrs wrote the chunk
-        # table offset into the 8-byte placeholder at offset_to_point_data.
-        if entries:
-            saved_pos = dest.tell()
-            dest.seek(offset_to_point_data)
-            chunk_table_offset = int.from_bytes(dest.read(8), "little", signed=True)
-            dest.seek(saved_pos)
-            entries[-1].byte_size = chunk_table_offset - entries[-1].offset
+        if _HAS_PARALLEL_CHUNKS and len(points) > 0:
+            entries = CopcWriter._compress_chunks_parallel(
+                dest, laz_vlr, octree.chunks, point_records_2d, offset_to_point_data
+            )
+        else:
+            entries = CopcWriter._compress_chunks_sequential(
+                dest, laz_vlr, octree.chunks, point_records_2d, offset_to_point_data
+            )
 
         # Preserve empty-node entries when reusing a source hierarchy
         for key in octree.zero_keys:
