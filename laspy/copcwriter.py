@@ -3,7 +3,7 @@ import logging
 import math
 from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from typing import BinaryIO, List, Optional, Union
 
@@ -64,7 +64,9 @@ def _morton_codes(
 @dataclass
 class OctreeChunk:
     key: VoxelKey
-    point_indices: np.ndarray
+    # Either an index array (freshly built octree) or a slice of the
+    # point array (structure reused from a source COPC file).
+    point_indices: Union[np.ndarray, slice]
 
 
 @dataclass
@@ -74,6 +76,9 @@ class OctreeResult:
     center: np.ndarray
     halfsize: float
     spacing: float
+    # Hierarchy entries with point_count == 0, preserved when reusing
+    # the structure of a source COPC file.
+    zero_keys: List[VoxelKey] = field(default_factory=list)
 
 
 def _build_octree(
@@ -273,6 +278,131 @@ def _build_octree(
     )
 
 
+def _chunks_still_contained(
+    points: PackedPointRecord,
+    header: LasHeader,
+    copc_info: CopcInfoVlr,
+    entries: List[Entry],
+    starts: np.ndarray,
+) -> bool:
+    """Check that every chunk's points still lie inside its node's cube.
+
+    Attribute-only edits always pass. Coordinate edits that moved points
+    out of their octree nodes make this return False, in which case the
+    octree must be rebuilt.
+    """
+    side = 2.0 * float(copc_info.halfsize)
+    root_min = np.asarray(copc_info.center, dtype=np.float64) - copc_info.halfsize
+
+    levels = np.array([e.key.level for e in entries], dtype=np.float64)
+    keys = np.array([[e.key.x, e.key.y, e.key.z] for e in entries], dtype=np.float64)
+    node_side = side / np.exp2(levels)
+
+    seg = starts[:-1].astype(np.intp)
+    for axis, dim in enumerate(("X", "Y", "Z")):
+        arr = np.ascontiguousarray(points[dim])
+        chunk_min = np.minimum.reduceat(arr, seg).astype(np.float64)
+        chunk_max = np.maximum.reduceat(arr, seg).astype(np.float64)
+
+        scale = header.scales[axis]
+        offset = header.offsets[axis]
+        node_min = (root_min[axis] + keys[:, axis] * node_side - offset) / scale
+        node_max = node_min + node_side / scale
+        # Tolerance of one integer unit, plus slack for float rounding.
+        eps = 1.0 + node_side * 1e-9 / scale
+        if np.any(chunk_min < node_min - eps) or np.any(chunk_max > node_max + eps):
+            return False
+    return True
+
+
+def _structure_from_header(
+    header: LasHeader, points: PackedPointRecord
+) -> Optional[OctreeResult]:
+    """Recover the octree layout of the source COPC file from its header
+    (CopcInfoVlr + CopcHierarchyVlr), so that an edited file can be written
+    without rebuilding the octree.
+
+    When a COPC file is read sequentially (laspy.read), points are
+    decompressed chunk after chunk in file order and each LAZ chunk is one
+    octree node. Hierarchy entries sorted by chunk offset therefore give
+    each node its slice of the point array.
+
+    Returns None when the structure cannot be reused: the header does not
+    come from a COPC file, the hierarchy is inconsistent with the points,
+    or points were moved outside their nodes.
+    """
+    n_points = len(points)
+    if n_points == 0:
+        return None
+
+    copc_info = next((v for v in header.vlrs if isinstance(v, CopcInfoVlr)), None)
+    if copc_info is None or copc_info.halfsize <= 0.0 or copc_info.spacing <= 0.0:
+        return None
+
+    hierarchy = None
+    for vlr_list in (header.evlrs, header.vlrs):
+        if vlr_list is None:
+            continue
+        hierarchy = next(
+            (v for v in vlr_list if isinstance(v, CopcHierarchyVlr)), None
+        )
+        if hierarchy is not None:
+            break
+    if hierarchy is None:
+        return None
+
+    # The hierarchy EVLR payload is a concatenation of pages, and pages are
+    # flat arrays of entries, so the whole payload can be parsed as entries.
+    # Entries with point_count == -1 only reference a child page (whose
+    # entries are in the same payload) and are skipped.
+    data = hierarchy.data
+    entry_size = VoxelKey.unpacker.size + Entry.unpacker.size
+    if not data or len(data) % entry_size != 0:
+        return None
+
+    point_entries = []
+    zero_keys = []
+    seen_keys = set()
+    for i in range(0, len(data), entry_size):
+        entry = Entry.from_bytes(data[i : i + entry_size])
+        if entry.point_count == -1:
+            continue
+        if entry.key in seen_keys:
+            return None
+        seen_keys.add(entry.key)
+        if entry.point_count == 0:
+            zero_keys.append(entry.key)
+        else:
+            point_entries.append(entry)
+
+    if sum(e.point_count for e in point_entries) != n_points:
+        return None
+
+    point_entries.sort(key=lambda e: e.offset)
+    counts = np.array([e.point_count for e in point_entries], dtype=np.int64)
+    starts = np.concatenate(([0], np.cumsum(counts)))
+
+    if not _chunks_still_contained(points, header, copc_info, point_entries, starts):
+        return None
+
+    chunks = [
+        OctreeChunk(
+            key=entry.key,
+            point_indices=slice(int(starts[i]), int(starts[i + 1])),
+        )
+        for i, entry in enumerate(point_entries)
+    ]
+
+    return OctreeResult(
+        chunks=chunks,
+        intermediate_keys=[],
+        center=np.array(copc_info.center, dtype=np.float64),
+        halfsize=float(copc_info.halfsize),
+        spacing=float(copc_info.spacing),
+        zero_keys=zero_keys,
+    )
+
+
 class CopcWriter:
     """Writes point cloud data as a COPC (Cloud Optimized Point Cloud) file.
 
@@ -287,6 +417,7 @@ class CopcWriter:
         points: PackedPointRecord,
         target_points_per_node: int = 100_000,
         max_depth: Optional[int] = None,
+        reuse_structure: bool = True,
     ) -> None:
         """Write points as a COPC file.
 
@@ -302,6 +433,12 @@ class CopcWriter:
             Target number of points per octree leaf node.
         max_depth : int, optional
             Maximum octree depth. Auto-computed if None.
+        reuse_structure : bool
+            When the header comes from a COPC file (e.g. laspy.read of a
+            .copc.laz) and the points still fit the source octree, reuse
+            that octree instead of rebuilding it. Attribute edits keep the
+            structure valid; coordinate edits that break it automatically
+            fall back to a full rebuild.
         """
         if lazrs is None:
             raise LaspyException("COPC writing requires the 'lazrs' package")
@@ -318,9 +455,13 @@ class CopcWriter:
 
         if isinstance(destination, str):
             with open(destination, "wb+") as f:
-                CopcWriter._write_copc(f, header, points, target_points_per_node, max_depth)
+                CopcWriter._write_copc(
+                    f, header, points, target_points_per_node, max_depth, reuse_structure
+                )
         else:
-            CopcWriter._write_copc(destination, header, points, target_points_per_node, max_depth)
+            CopcWriter._write_copc(
+                destination, header, points, target_points_per_node, max_depth, reuse_structure
+            )
 
     @staticmethod
     def _write_copc(
@@ -329,6 +470,7 @@ class CopcWriter:
         points: PackedPointRecord,
         target_points_per_node: int,
         max_depth: Optional[int],
+        reuse_structure: bool = True,
     ) -> None:
         header = deepcopy(header)
         header.are_points_compressed = True
@@ -367,8 +509,18 @@ class CopcWriter:
             header.maxs = [0.0, 0.0, 0.0]
             header.mins = [0.0, 0.0, 0.0]
 
-        # Build octree
-        octree = _build_octree(points, header, target_points_per_node, max_depth)
+        # Reuse the octree structure of the source COPC file when possible,
+        # otherwise build a new octree.
+        octree = None
+        if reuse_structure:
+            octree = _structure_from_header(header, points)
+        if octree is not None:
+            logger.info(
+                "Reusing COPC octree structure from source (%d chunks)",
+                len(octree.chunks),
+            )
+        else:
+            octree = _build_octree(points, header, target_points_per_node, max_depth)
 
         # Create CopcInfoVlr with placeholder hierarchy offset
         copc_info = CopcInfoVlr()
@@ -427,7 +579,7 @@ class CopcWriter:
         last_idx = len(octree.chunks) - 1
         for i, chunk in enumerate(octree.chunks):
             idx = chunk.point_indices
-            n_pts = len(idx)
+            n_pts = (idx.stop - idx.start) if isinstance(idx, slice) else len(idx)
 
             # Extract point bytes: copies only n_pts × point_size uint8 bytes.
             chunk_bytes = point_records_2d[idx].ravel()
@@ -466,6 +618,12 @@ class CopcWriter:
             chunk_table_offset = int.from_bytes(dest.read(8), "little", signed=True)
             dest.seek(saved_pos)
             entries[-1].byte_size = chunk_table_offset - entries[-1].offset
+
+        # Preserve empty-node entries when reusing a source hierarchy
+        for key in octree.zero_keys:
+            entry = Entry()
+            entry.key = key
+            entries.append(entry)
 
         # Build hierarchy EVLR data (all entries concatenated)
         entry_bytes = b"".join(e.to_bytes() for e in entries)
