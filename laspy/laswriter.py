@@ -80,6 +80,10 @@ class LasWriter:
             except ValueError:
                 pass
 
+        # Never emit an ExtraBytes record describing dimensions this point record
+        # has no room for -- strict readers reject the whole file.
+        self.header._prune_overlong_extra_bytes_vlr()
+
         if self.update_header:
             self.header.partial_reset()
 

@@ -977,6 +977,46 @@ class LasHeader:
 
         return header_bytes + rest
 
+    def _prune_overlong_extra_bytes_vlr(self) -> None:
+        """Repair an ExtraBytes record that claims more bytes than the point record holds.
+
+        Every mutation path on this class resyncs the ExtraBytes record with the
+        point format, but mutating ``vlrs`` in place (``append`` / ``extend``)
+        bypasses that, so a record copied in from another file can outlive the
+        dimensions it describes. PDAL and QGIS reject the resulting file outright
+        with "Extra byte specification exceeds point length beyond base format
+        length", while laspy reads it back without complaint -- which makes the
+        corruption easy to write and hard to notice.
+
+        Only an *over*-declaring record is rebuilt. A record that already agrees
+        with the point format is left strictly alone, since rebuilding discards
+        min/max values grown from the point data. Declaring *fewer* bytes than the
+        point record carries is legal -- a file may hold undocumented extra bytes
+        with no record at all -- and is likewise left untouched.
+        """
+        eb_vlrs = self._vlrs.get("ExtraBytesVlr")
+        if not eb_vlrs:
+            return
+
+        declared_bytes = 0
+        for eb_vlr in eb_vlrs:
+            for eb_struct in eb_vlr.extra_bytes_structs:
+                dtype = eb_struct.dtype()
+                if dtype is None:
+                    return  # cannot size it reliably; leave the record as-is
+                declared_bytes += dtype.itemsize
+
+        if declared_bytes <= self.point_format.num_extra_bytes:
+            return
+
+        logger.warning(
+            "ExtraBytes VLR declares %d byte(s) per point but the point record "
+            "only has room for %d; rebuilding it from the point format",
+            declared_bytes,
+            self.point_format.num_extra_bytes,
+        )
+        self._sync_extra_bytes_vlr()
+
     def _sync_extra_bytes_vlr(self) -> None:
         # Drop any existing ExtraBytesVlr — we'll rebuild it from the current
         # point_format's extras.  For each extra dim, prefer the original
@@ -987,7 +1027,17 @@ class LasHeader:
         # sets MIN_BIT/MAX_BIT and fills ``_min``/``_max`` with sentinel
         # bytes via ``partial_reset``, which rewrites extras whose source
         # options byte was 0 ("not declared") to claim bogus min/max values.
-        self._vlrs.extract("ExtraBytesVlr")
+        #
+        # Match on ``(user_id, record_id)`` rather than on the parsed class name:
+        # a LASF_Spec/4 record whose payload failed to parse stays a plain ``VLR``
+        # and would otherwise survive the rebuild.
+        eb_user_id = ExtraBytesVlr.official_user_id()
+        eb_record_ids = ExtraBytesVlr.official_record_ids()
+        self._vlrs[:] = [
+            vlr
+            for vlr in self._vlrs
+            if not (vlr.user_id == eb_user_id and vlr.record_id in eb_record_ids)
+        ]
 
         extra_dimensions = list(self.point_format.extra_dimensions)
         if not extra_dimensions:

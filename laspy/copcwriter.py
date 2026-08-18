@@ -598,6 +598,9 @@ class CopcWriter:
         header = deepcopy(header)
         header.are_points_compressed = True
         header.point_count = len(points)
+        # Same guard as LasWriter, and it must run before the min/max grow pass
+        # below reads the record back.
+        header._prune_overlong_extra_bytes_vlr()
         # CopcWriter stores hierarchy via CopcInfoVlr, not as LAS EVLRs.
         # Clear these fields to prevent readers from seeking to a stale/zero offset.
         header.start_of_first_evlr = 0
