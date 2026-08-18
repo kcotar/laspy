@@ -1,3 +1,4 @@
+import ctypes
 import io
 from typing import Any, BinaryIO, Optional
 
@@ -7,7 +8,7 @@ from .._pointappender import IPointAppender
 from .._pointreader import IPointReader
 from .._pointwriter import IPointWriter
 from ..errors import LaspyException
-from ..header import LasHeader
+from ..header import LAS_HEADERS_SIZE, LasHeader
 from ..point.record import PackedPointRecord
 from .lazbackend import ILazBackend
 from .selection import DecompressionSelection
@@ -16,6 +17,10 @@ try:
     import laszip
 except ModuleNotFoundError:
     laszip = None
+
+# Size of a (non-extended) VLR header on disk:
+# 2 (reserved) + 16 (user_id) + 2 (record_id) + 2 (record_length) + 32 (description)
+VLR_HEADER_SIZE = 54
 
 
 class LaszipBackend(ILazBackend):
@@ -121,16 +126,99 @@ class LaszipPointWriter(IPointWriter):
         # Do nothing as creating the laszip zipper writes the header and vlrs
         pass
 
+    @staticmethod
+    def _copy_extra_bytes_min_max(src_vlr, dst_vlr) -> None:
+        # Copy the data-derived min/max (and the no_data / options metadata that
+        # goes with them) from the in-memory, already-grown ExtraBytes structs
+        # onto the structs parsed from disk. Matched by name so it is robust to
+        # ordering differences; the byte layout of the special-property slots is
+        # identical between the two, so a raw memmove is safe and size-preserving.
+        src_by_name = {st.format_name(): st for st in src_vlr.extra_bytes_structs}
+        for dst_st in dst_vlr.extra_bytes_structs:
+            src_st = src_by_name.get(dst_st.format_name())
+            if src_st is None:
+                continue
+            dst_st.options = src_st.options
+            for slot in ("_min", "_max", "_no_data"):
+                ctypes.memmove(
+                    ctypes.addressof(getattr(dst_st, slot)),
+                    ctypes.addressof(getattr(src_st, slot)),
+                    ctypes.sizeof(getattr(dst_st, slot)),
+                )
+
+    def _find_vlr_on_disk(self, header: "LasHeader", user_id: str, record_id: int):
+        """Locate a VLR's record-data offset and on-disk length by walking the VLR
+        headers laszip actually wrote.
+
+        Reading the on-disk ``record_length`` fields (rather than trusting laspy's
+        re-serialised VLR sizes) keeps this immune to VLRs that do not round-trip
+        byte-for-byte through laspy's typed parsers.
+        """
+        pos = LAS_HEADERS_SIZE[str(header.version)] + len(header.extra_header_bytes)
+        for _ in range(len(header.vlrs)):
+            self.dest.seek(pos, io.SEEK_SET)
+            vlr_header = self.dest.read(VLR_HEADER_SIZE)
+            if len(vlr_header) < VLR_HEADER_SIZE:
+                break
+            disk_user_id = vlr_header[2:18].split(b"\x00", 1)[0].decode(
+                "ascii", "replace"
+            )
+            disk_record_id = int.from_bytes(vlr_header[18:20], "little", signed=False)
+            record_length = int.from_bytes(vlr_header[20:22], "little", signed=False)
+            data_offset = pos + VLR_HEADER_SIZE
+            if disk_user_id == user_id and disk_record_id == record_id:
+                return data_offset, record_length
+            pos = data_offset + record_length
+        return None
+
     def write_updated_header(self, header: LasHeader, encoding_errors: str) -> None:
+        # The laszip zipper serialised the header + VLRs when this writer was
+        # constructed, so two things still need fixing up on disk: the EVLR
+        # offset/count (the EVLRs are appended only after the point stream), and the
+        # ExtraBytes VLR min/max (laszip wrote the ``partial_reset`` sentinels --
+        # bogus values such as -0.01 / 0 -- before the point stream let ``grow()``
+        # compute the real range).
+        #
+        # We patch ONLY those bytes, in place. We deliberately do NOT re-serialise
+        # the whole header (as the lazrs backends do): laszip's on-disk VLR bytes
+        # are not guaranteed to round-trip byte-for-byte through laspy's typed VLR
+        # parsers -- a LASF_Spec classification-lookup record, or any vendor VLR
+        # laspy normalises on parse, can re-serialise to a different length. That
+        # would change offset_to_point_data and raise "writing header would change
+        # original offset to data" (or, worse, silently corrupt the file). Patching
+        # bytes in place leaves every other VLR -- and the data offset -- untouched.
+        in_mem_eb = header.vlrs.get("ExtraBytesVlr")
+
+        if header.number_of_evlrs == 0 and not in_mem_eb:
+            return
+
         if header.number_of_evlrs != 0:
-            # We wrote some evlrs, we have to update the header
+            # In a 1.4 header the EVLR bookkeeping immediately follows the 1.3
+            # header block: start_of_first_evlr (8 bytes) then number_of_evlrs (4).
+            self.dest.seek(LAS_HEADERS_SIZE["1.3"], io.SEEK_SET)
+            self.dest.write(
+                header.start_of_first_evlr.to_bytes(8, "little", signed=False)
+            )
+            self.dest.write(
+                header.number_of_evlrs.to_bytes(4, "little", signed=False)
+            )
+
+        if in_mem_eb:
             self.dest.seek(0, io.SEEK_SET)
             file_header = LasHeader.read_from(self.dest)
-            end_of_header_pos = self.dest.tell()
-            file_header.number_of_evlrs = header.number_of_evlrs
-            file_header.start_of_first_evlr = header.start_of_first_evlr
-            self.dest.seek(0, io.SEEK_SET)
-            file_header.write_to(
-                self.dest, ensure_same_size=True, encoding_errors=encoding_errors
-            )
-            assert self.dest.tell() == end_of_header_pos
+            file_eb = file_header.vlrs.get("ExtraBytesVlr")
+            if file_eb:
+                self._copy_extra_bytes_min_max(in_mem_eb[0], file_eb[0])
+                located = self._find_vlr_on_disk(
+                    file_header, file_eb[0].user_id, file_eb[0].record_id
+                )
+                if located is not None:
+                    data_offset, on_disk_len = located
+                    new_record_data = file_eb[0].record_data_bytes()
+                    # Size-preserving by construction; guard so an unexpected
+                    # mismatch degrades to stale min/max rather than a broken file.
+                    if len(new_record_data) == on_disk_len:
+                        self.dest.seek(data_offset, io.SEEK_SET)
+                        self.dest.write(new_record_data)
+
+        self.dest.seek(0, io.SEEK_END)

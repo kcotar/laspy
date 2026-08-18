@@ -23,6 +23,7 @@ class LasReader:
         source: BinaryIO,
         closefd: bool = True,
         laz_backend: Optional[Union[LazBackend, Iterable[LazBackend]]] = None,
+        header_only: bool = False,
         read_evlrs: bool = True,
         decompression_selection: DecompressionSelection = DecompressionSelection.all(),
     ):
@@ -34,6 +35,7 @@ class LasReader:
         source: file_object
         closefd: bool, default True
         laz_backend: LazBackend or list of LazBackend, optional
+        header_only: bool, default False
         read_evlrs: bool, default True
             only applies to __init__ phase, and for files
             that support evlrs
@@ -44,12 +46,14 @@ class LasReader:
         .. versionadded:: 2.4
             The ``read_evlrs`` and ``decompression_selection`` parameters.
         """
+
         self.closefd = closefd
         if laz_backend is None:
             laz_backend = LazBackend.detect_available()
         self.laz_backend = laz_backend
         self.header = LasHeader.read_from(source, read_evlrs=read_evlrs)
         self.decompression_selection = decompression_selection
+        self.header_only = header_only
 
         # The point source is lazily instanciated.
         # Because some reader implementation may
@@ -130,6 +134,7 @@ class LasReader:
             self.header.version.minor >= 4
             and self.header.number_of_evlrs > 0
             and self.evlrs is None
+            and not self.header_only
         )
         if shall_read_evlr:
             # If we have to read evlrs by now, it either means:
@@ -286,7 +291,7 @@ class LasReader:
         raise last_error
 
     def _create_point_source(self, source) -> IPointReader:
-        if self.header.point_count > 0:
+        if self.header.point_count > 0 and not self.header_only:
             if self.header.are_points_compressed:
                 point_source = self._create_laz_backend(source)
                 if point_source is None:

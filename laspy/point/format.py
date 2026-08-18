@@ -19,6 +19,7 @@ class ExtraBytesParams:
         description: str = "",
         offsets: Optional[Iterable[Number]] = None,
         scales: Optional[Iterable[Number]] = None,
+        no_data: Optional[Iterable[Number]] = None,
     ) -> None:
         self.name = name
         """ The name of the extra dimension """
@@ -37,6 +38,15 @@ class ExtraBytesParams:
         """ The offsets to use if its a 'scaled dimension', can be none """
         self.scales = np.array(scales) if scales is not None else scales
         """ The scales to use if its a 'scaled dimension', can be none """
+        self.no_data = np.array(no_data) if no_data is not None else no_data
+        """ The no data values, can be none """
+        self.source_struct = None
+        """ Optional reference to the parsed ``ExtraBytesStruct`` this dim
+        came from.  Populated by :py:meth:`ExtraBytesVlr.type_of_extra_dims`
+        so the exact on-disk bytes (options byte, min/max slots, per-dim
+        padding) can be reused when the header is re-serialised, avoiding
+        information loss through the constructor / ``partial_reset`` path.
+        ``None`` for extras added via user API. """
 
 
 class PointFormat:
@@ -194,6 +204,12 @@ class PointFormat:
             and dim_info.kind != dims.DimensionKind.UnsignedInteger
         ):
             raise LaspyException("Extra Dimensions do not support more than 3 elements")
+        # Carry the source ExtraBytesStruct (if any) through to the
+        # DimensionInfo so ``LasHeader._sync_extra_bytes_vlr`` can re-use it
+        # verbatim and preserve the original options byte / per-dim bytes.
+        dim_info = dim_info._replace(
+            source_struct=getattr(param, "source_struct", None)
+        )
         self.dimensions.append(dim_info)
 
     def remove_extra_dimension(self, name: str) -> None:

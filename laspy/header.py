@@ -3,6 +3,7 @@ import io
 import logging
 import struct
 import typing
+from copy import deepcopy
 from datetime import date, timedelta
 from typing import BinaryIO, Iterable, List, NamedTuple, Optional, Union
 from uuid import UUID
@@ -71,6 +72,8 @@ class GlobalEncoding:
     WAVEFORM_EXTERNAL_MASK = 0b0000_0000_0000_0100  # 1.3
     SYNTHETIC_RETURN_NUMBERS_MASK = 0b0000_0000_0000_1000  # 1.3
     WKT_MASK = 0b0000_0000_0001_0000  # 1.4
+    RESERVED = 0b0000_0000_0010_0000
+    GPS_TIME_OFFSET_MASK = 0b0000_0000_0100_0000
 
     def __init__(self, value=0):
         self.value = value
@@ -79,7 +82,7 @@ class GlobalEncoding:
         self.value |= mask
 
     def _unset_bit(self, mask):
-        self.value ^= mask
+        self.value &= ~mask
 
     def _set_if_true(self, mask, value):
         if bool(value) is True:
@@ -93,7 +96,7 @@ class GlobalEncoding:
 
     @gps_time_type.setter
     def gps_time_type(self, value: GpsTimeType):
-        self.value ^= self.GPS_TIME_TYPE_MASK
+        self.value &= ~self.GPS_TIME_TYPE_MASK
         self.value |= int(value) & self.GPS_TIME_TYPE_MASK
 
     @property
@@ -127,6 +130,18 @@ class GlobalEncoding:
     @wkt.setter
     def wkt(self, value):
         self._set_if_true(self.WKT_MASK, value)
+
+    @property
+    def gps_time_offset(self) -> bool:
+        return bool(self.value & self.GPS_TIME_OFFSET_MASK)
+
+    @gps_time_offset.setter
+    def gps_time_offset(self, value):
+        self._set_if_true(self.GPS_TIME_OFFSET_MASK, value)
+        if value:
+            # Standard says that of the offset mask is true,
+            # then the gps time type must also be
+            self._set_if_true(self.GPS_TIME_TYPE_MASK, value)
 
     @classmethod
     def read_from(cls, stream: BinaryIO) -> "GlobalEncoding":
@@ -194,7 +209,7 @@ class LasHeader:
 
         if version is None and point_format is None:
             version = LasHeader.DEFAULT_VERSION
-            point_format = LasHeader.DEFAULT_POINT_FORMAT
+            point_format = deepcopy(LasHeader.DEFAULT_POINT_FORMAT)
         elif version is not None and point_format is None:
             point_format = PointFormat(dims.min_point_format_for_version(str(version)))
         elif version is None and point_format is not None:
@@ -232,7 +247,7 @@ class LasHeader:
 
         #: Number of points by return
         #: for las <= 1.2 only the first 5 elements matters
-        self.number_of_points_by_return: np.ndarray = np.zeros(15, dtype=np.uint32)
+        self.number_of_points_by_return: np.ndarray = np.zeros(15, dtype=np.uint64)
 
         #: The VLRS
         self._vlrs: VLRList = VLRList()
@@ -250,6 +265,14 @@ class LasHeader:
         self.start_of_first_evlr: int = 0
         #: The number of evlrs in the file
         self.number_of_evlrs: int = 0
+
+        #: Las >= 1.5
+        #: Max value of GPS Time
+        self.max_gps_time: float = 0.0
+        #: Min value of GPS Time
+        self.min_gps_time: float = 0.0
+        #: Used to optimize GPS Time precision
+        self.gps_time_offset: int = 0
 
         #: EVLRs, even though they are not stored in the 'header'
         #: part of the file we keep them in this class
@@ -470,10 +493,19 @@ class LasHeader:
         self.maxs = np.ones(3, dtype=np.float64) * f64info.min
         self.mins = np.ones(3, dtype=np.float64) * f64info.max
 
+        self.max_gps_time = float(f64info.min)
+        self.min_gps_time = float(f64info.max)
+
         self.start_of_first_evlr = 0
         self.number_of_evlrs = 0
         self.point_count = 0
-        self.number_of_points_by_return = np.zeros(15, dtype=np.uint32)
+        self.number_of_points_by_return = np.zeros(15, dtype=np.uint64)
+
+        try:
+            eb_vlr = self.vlrs.get("ExtraBytesVlr")[0]
+            eb_vlr.partial_reset()
+        except IndexError:
+            pass
 
     def update(self, points: PackedPointRecord) -> None:
         self.partial_reset()
@@ -509,6 +541,13 @@ class LasHeader:
             (points["Z"].min() * self.z_scale) + self.z_offset,
         )
 
+        try:
+            gps_time = points["gps_time"]
+            self.max_gps_time = max(self.max_gps_time, gps_time.max())
+            self.min_gps_time = min(self.min_gps_time, gps_time.min())
+        except ValueError:
+            pass
+
         for return_number, count in zip(
             *np.unique(points.return_number, return_counts=True)
         ):
@@ -519,6 +558,11 @@ class LasHeader:
             self.number_of_points_by_return[return_number - 1] += count
         self.point_count += len(points)
 
+        # grow extra bytes
+        vlrs = self.vlrs.get("ExtraBytesVlr")
+        if vlrs:
+            vlrs[0].grow(points)
+
     def set_compressed(self, state: bool) -> None:
         self.are_points_compressed = state
 
@@ -527,6 +571,9 @@ class LasHeader:
             return np.iinfo(np.uint32).max
         else:
             return np.iinfo(np.uint64).max
+
+    def copy(self):
+        return deepcopy(self)
 
     @classmethod
     def read_from(
@@ -616,6 +663,12 @@ class LasHeader:
                 header.number_of_points_by_return[i] = int.from_bytes(
                     stream.read(8), little_endian, signed=False
                 )
+        if header.version.minor >= 5:
+            header.max_gps_time = struct.unpack("<d", stream.read(8))[0]
+            header.min_gps_time = struct.unpack("<d", stream.read(8))[0]
+            header.gps_time_offset = int.from_bytes(
+                stream.read(2), little_endian, signed=False
+            )
 
         current_pos = stream.tell()
         if current_pos < header_size:
@@ -636,13 +689,8 @@ class LasHeader:
         header.are_points_compressed = is_point_format_compressed(point_format_id)
         point_format_id = compressed_id_to_uncompressed(point_format_id)
         point_format = PointFormat(point_format_id)
-        try:
-            extra_bytes_vlr = typing.cast(
-                ExtraBytesVlr, header._vlrs.get("ExtraBytesVlr")[0]
-            )
-        except IndexError:
-            pass
-        else:
+        extra_bytes_vlrs = header._vlrs.get("ExtraBytesVlr")
+        if extra_bytes_vlrs:
             if point_size == point_format.size:
                 logger.warning(
                     "There is an ExtraByteVlr but the header.point_size matches the "
@@ -650,8 +698,14 @@ class LasHeader:
                 )
                 header._vlrs.extract("ExtraBytesVlr")
             else:
-                for extra_dim_info in extra_bytes_vlr.type_of_extra_dims():
-                    point_format.add_extra_dimension(extra_dim_info)
+                # LAS 1.4 files produced by multi-vendor pipelines (e.g. RIEGL +
+                # TerraScan) may carry more than one ExtraBytesVlr. Consume them
+                # all in order so every declared extra dimension is registered
+                # on the point format.
+                for eb_vlr in extra_bytes_vlrs:
+                    eb_vlr = typing.cast(ExtraBytesVlr, eb_vlr)
+                    for extra_dim_info in eb_vlr.type_of_extra_dims():
+                        point_format.add_extra_dimension(extra_dim_info)
         header._point_format = point_format
 
         if point_size > point_format.size:
@@ -805,6 +859,12 @@ class LasHeader:
                         8, little_endian, signed=False
                     )
                 )
+
+        if self.version.minor >= 5:
+            stream.write(struct.pack("<d", self.max_gps_time))
+            stream.write(struct.pack("<d", self.min_gps_time))
+            stream.write(self.gps_time_offset.to_bytes(2, little_endian, signed=False))
+
         stream.write(self.extra_header_bytes)
         stream.write(vlr_bytes)
         stream.write(self.extra_vlr_bytes)
@@ -917,11 +977,67 @@ class LasHeader:
 
         return header_bytes + rest
 
+    def _prune_overlong_extra_bytes_vlr(self) -> None:
+        """Repair an ExtraBytes record that claims more bytes than the point record holds.
+
+        Every mutation path on this class resyncs the ExtraBytes record with the
+        point format, but mutating ``vlrs`` in place (``append`` / ``extend``)
+        bypasses that, so a record copied in from another file can outlive the
+        dimensions it describes. PDAL and QGIS reject the resulting file outright
+        with "Extra byte specification exceeds point length beyond base format
+        length", while laspy reads it back without complaint -- which makes the
+        corruption easy to write and hard to notice.
+
+        Only an *over*-declaring record is rebuilt. A record that already agrees
+        with the point format is left strictly alone, since rebuilding discards
+        min/max values grown from the point data. Declaring *fewer* bytes than the
+        point record carries is legal -- a file may hold undocumented extra bytes
+        with no record at all -- and is likewise left untouched.
+        """
+        eb_vlrs = self._vlrs.get("ExtraBytesVlr")
+        if not eb_vlrs:
+            return
+
+        declared_bytes = 0
+        for eb_vlr in eb_vlrs:
+            for eb_struct in eb_vlr.extra_bytes_structs:
+                dtype = eb_struct.dtype()
+                if dtype is None:
+                    return  # cannot size it reliably; leave the record as-is
+                declared_bytes += dtype.itemsize
+
+        if declared_bytes <= self.point_format.num_extra_bytes:
+            return
+
+        logger.warning(
+            "ExtraBytes VLR declares %d byte(s) per point but the point record "
+            "only has room for %d; rebuilding it from the point format",
+            declared_bytes,
+            self.point_format.num_extra_bytes,
+        )
+        self._sync_extra_bytes_vlr()
+
     def _sync_extra_bytes_vlr(self) -> None:
-        try:
-            self._vlrs.extract("ExtraBytesVlr")
-        except IndexError:
-            pass
+        # Drop any existing ExtraBytesVlr — we'll rebuild it from the current
+        # point_format's extras.  For each extra dim, prefer the original
+        # on-disk ``ExtraBytesStruct`` (carried on ``DimensionInfo.source_struct``
+        # when the dim came from a parsed file) so the options byte and
+        # per-dim padding round-trip byte-for-byte.  Rebuilding via the
+        # ``ExtraBytesStruct(...)`` constructor is lossy: it unconditionally
+        # sets MIN_BIT/MAX_BIT and fills ``_min``/``_max`` with sentinel
+        # bytes via ``partial_reset``, which rewrites extras whose source
+        # options byte was 0 ("not declared") to claim bogus min/max values.
+        #
+        # Match on ``(user_id, record_id)`` rather than on the parsed class name:
+        # a LASF_Spec/4 record whose payload failed to parse stays a plain ``VLR``
+        # and would otherwise survive the rebuild.
+        eb_user_id = ExtraBytesVlr.official_user_id()
+        eb_record_ids = ExtraBytesVlr.official_record_ids()
+        self._vlrs[:] = [
+            vlr
+            for vlr in self._vlrs
+            if not (vlr.user_id == eb_user_id and vlr.record_id in eb_record_ids)
+        ]
 
         extra_dimensions = list(self.point_format.extra_dimensions)
         if not extra_dimensions:
@@ -932,21 +1048,51 @@ class LasHeader:
             dtype = extra_dimension.dtype
             assert dtype is not None
 
+            # LAS 1.4 R14 deprecated array data_types 11-30 (e.g. 11 = uint8[2],
+            # 21 = uint8[3]). Strict readers like copc.js / Potree reject them.
+            # Collapse to raw bytes (data_type=0 + options=size_in_bytes) when
+            # the dim is plain uint8 with no typed-value semantics (no scale,
+            # offset, or no_data) — this covers the auto-generated
+            # "Un-registered ExtraBytes" path. User-defined arrays that carry
+            # scale/offset/no_data metadata are preserved as the typed array,
+            # since collapsing them would silently lose that metadata.
+            has_typed_metadata = (
+                extra_dimension.scales is not None
+                or extra_dimension.offsets is not None
+                or extra_dimension.no_data is not None
+            )
+            if (
+                extra_dimension.num_elements > 1
+                and dtype.base == np.uint8
+                and not has_typed_metadata
+            ):
+                data_type = (0, extra_dimension.num_elements)
+            else:
+                data_type = extradims.get_id_for_extra_dim_type(dtype)
+
+            source_struct = getattr(extra_dimension, "source_struct", None)
+            expected_data_type = (
+                data_type if isinstance(data_type, int) else data_type[0]
+            )
+            # Re-use the parsed struct when the dim still matches the
+            # original definition (name + data_type); fall through to a
+            # fresh build if the user has renamed/retyped it.
+            if (
+                source_struct is not None
+                and source_struct.name.rstrip(b"\x00") == extra_dimension.name.encode()
+                and source_struct.data_type == expected_data_type
+            ):
+                eb_vlr.extra_bytes_structs.append(source_struct)
+                continue
+
             eb_struct = ExtraBytesStruct(
                 name=extra_dimension.name.encode(),
                 description=extra_dimension.description.encode(),
+                data_type=data_type,
+                scale=extra_dimension.scales,
+                offset=extra_dimension.offsets,
+                no_data=extra_dimension.no_data,
             )
-
-            if extra_dimension.num_elements > 3 and dtype.base == np.uint8:
-                type_id = 0
-                eb_struct.options = extra_dimension.num_elements
-            else:
-                type_id = extradims.get_id_for_extra_dim_type(dtype)
-
-            eb_struct.data_type = type_id
-            eb_struct.scale = extra_dimension.scales
-            eb_struct.offset = extra_dimension.offsets
-
             eb_vlr.extra_bytes_structs.append(eb_struct)
 
         self._vlrs.append(eb_vlr)
@@ -981,4 +1127,5 @@ LAS_HEADERS_SIZE = {
     "1.2": 227,
     "1.3": 235,
     "1.4": 375,
+    "1.5": 393,
 }

@@ -1,8 +1,9 @@
-""" Contains the classes that manages Las PointRecords
+"""Contains the classes that manages Las PointRecords
 Las PointRecords are represented using Numpy's structured arrays,
 The PointRecord classes provide a few extra things to manage these arrays
 in the context of Las point data
 """
+
 import logging
 from copy import deepcopy
 from enum import Enum, auto
@@ -52,7 +53,7 @@ class PackedPointRecord:
     >>> return_number
     <SubFieldView([0 0 0 0 0 0 0 0 0 0])>
     >>> return_number[:] = 1
-    >>> np.alltrue(packed_point_record['return_number'] == 1)
+    >>> bool(np.all(packed_point_record['return_number'] == 1))
     True
     """
 
@@ -129,11 +130,29 @@ class PackedPointRecord:
 
     def copy_fields_from(self, other_record: "PackedPointRecord") -> None:
         """Tries to copy the values of the current dimensions from other_record"""
+        src_names = set(other_record.point_format.dimension_names)
+        copied = set()
         for dim_name in self.point_format.dimension_names:
             try:
                 self[dim_name] = np.array(other_record[dim_name])
+                copied.add(dim_name)
             except ValueError:
                 pass
+
+        # Handle renamed dimensions with unit conversion (e.g. scan_angle_rank <-> scan_angle)
+        for (name_a, name_b), factor in dims.DIMENSION_CONVERSIONS.items():
+            if name_b not in copied and name_b in self.point_format.dimension_names and name_a in src_names:
+                dst_dtype = dims.DIMENSIONS_TO_TYPE[name_b]
+                self[name_b] = np.round(
+                    other_record[name_a].astype(np.float64) * factor
+                ).astype(dst_dtype)
+            elif name_a not in copied and name_a in self.point_format.dimension_names and name_b in src_names:
+                dst_dtype = dims.DIMENSIONS_TO_TYPE[name_a]
+                self[name_a] = np.clip(
+                    np.round(other_record[name_b].astype(np.float64) / factor),
+                    np.iinfo(dst_dtype).min,
+                    np.iinfo(dst_dtype).max,
+                ).astype(dst_dtype)
 
     def copy(self) -> "PackedPointRecord":
         return PackedPointRecord(self.array.copy(), deepcopy(self.point_format))

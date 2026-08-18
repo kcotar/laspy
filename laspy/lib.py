@@ -1,6 +1,7 @@
-""" 'Entry point' of the library, Contains the various functions meant to be
+"""'Entry point' of the library, Contains the various functions meant to be
 used directly by a user
 """
+
 import copy
 import io
 import logging
@@ -30,6 +31,7 @@ def open_las(
     header=None,
     do_compress=None,
     encoding_errors: str = "strict",
+    header_only: bool = False,
     read_evlrs: bool = True,
     decompression_selection: DecompressionSelection = DecompressionSelection.all(),
 ) -> Union[LasReader, LasWriter, LasAppender]:
@@ -148,6 +150,7 @@ def open_las(
                 stream,
                 closefd=closefd,
                 laz_backend=laz_backend,
+                header_only=header_only,
                 read_evlrs=read_evlrs,
                 decompression_selection=decompression_selection,
             )
@@ -210,6 +213,7 @@ def read_las(
     closefd=True,
     laz_backend=LazBackend.detect_available(),
     decompression_selection: DecompressionSelection = DecompressionSelection.all(),
+    encoding_errors: str = "strict",
 ):
     """Entry point for reading las data in laspy
 
@@ -235,6 +239,11 @@ def read_las(
     decompression_selection: DecompressionSelection,
         see :func:`laspy.open`
 
+    encoding_errors: str, default 'strict'
+        Only used in writing and appending mode.
+        How encoding errors should be treated.
+        Possible values and their explanation can be seen here:
+        https://docs.python.org/3/library/codecs.html#error-handlers.
 
     Returns
     -------
@@ -244,12 +253,16 @@ def read_las(
 
     .. versionadded:: 2.4
         The ``decompression_selection`` parameter.
+
+    .. versionadded:: 2.6
+        The ``encoding_errors`` parameter.
     """
     with open_las(
         source,
         closefd=closefd,
         laz_backend=laz_backend,
         decompression_selection=decompression_selection,
+        encoding_errors=encoding_errors,
     ) as reader:
         return reader.read()
 
