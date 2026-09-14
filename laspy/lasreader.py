@@ -26,6 +26,7 @@ class LasReader:
         header_only: bool = False,
         read_evlrs: bool = True,
         decompression_selection: DecompressionSelection = DecompressionSelection.all(),
+        strict_point_count: bool = True,
     ):
         """
         Initialize the LasReader
@@ -54,6 +55,7 @@ class LasReader:
         self.header = LasHeader.read_from(source, read_evlrs=read_evlrs)
         self.decompression_selection = decompression_selection
         self.header_only = header_only
+        self.strict_point_count = strict_point_count
 
         # The point source is lazily instanciated.
         # Because some reader implementation may
@@ -111,13 +113,32 @@ class LasReader:
             self.point_source.read_n_points(n), self.header.point_format
         )
         if len(r) < n:
+            # The requested count was already clamped to what the header says is left, so a
+            # short read here is never benign: the point data ends early and everything past
+            # this offset is gone. Upstream laspy logs and carries on, which loses the data
+            # silently.
+            present = self.points_read + len(r)
+            message = (
+                f"File is truncated: the header declares {self.header.point_count} points "
+                f"but the point data ends after {present}. Asked for {n} points at offset "
+                f"{self.points_read}, got {len(r)}."
+            )
+            if self.strict_point_count:
+                raise errors.TruncatedPointDataError(
+                    message,
+                    declared_point_count=self.header.point_count,
+                    points_present=present,
+                )
             logger.error(f"Could only read {len(r)} of the requested {n} points")
 
         points = record.ScaleAwarePointRecord(
             r.array, r.point_format, self.header.scales, self.header.offsets
         )
 
-        self.points_read += n
+        # Advance by what was actually read, not what was asked for: on a short read the
+        # two differ, and charging the full request leaves points_read overstating the
+        # file and seek()/points_left working off a wrong offset.
+        self.points_read += len(r)
         return points
 
     def read(self) -> LasData:

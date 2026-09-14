@@ -34,6 +34,7 @@ def open_las(
     header_only: bool = False,
     read_evlrs: bool = True,
     decompression_selection: DecompressionSelection = DecompressionSelection.all(),
+    strict_point_count: bool = True,
 ) -> Union[LasReader, LasWriter, LasAppender]:
     """The laspy.open opens a LAS/LAZ file in one of the 3 supported
     mode:
@@ -153,6 +154,7 @@ def open_las(
                 header_only=header_only,
                 read_evlrs=read_evlrs,
                 decompression_selection=decompression_selection,
+                strict_point_count=strict_point_count,
             )
         except:
             if closefd:
