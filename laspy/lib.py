@@ -18,6 +18,7 @@ from .lasmmap import LasMMAP
 from .lasreader import LasReader
 from .laswriter import LasWriter
 from .point import PointFormat, dims, record
+from .vlrs.known import WaveformPacketVlr
 from .vlrs.vlrlist import VLRList
 
 logger = logging.getLogger(__name__)
@@ -322,6 +323,16 @@ def create_las(
     return LasData(header=header)
 
 
+# Waveform Packet Descriptor VLRs and, for internal waveforms, the EVLR holding the
+# packets themselves. Both live under the "LASF_Spec" user id (LAS 1.4 R15, table 9).
+WAVEFORM_DESCRIPTOR_IDS = frozenset(WaveformPacketVlr.official_record_ids())
+WAVEFORM_DATA_PACKET_IDS = frozenset({65535})
+
+
+def _is_waveform_vlr(vlr, record_ids) -> bool:
+    return vlr.user_id == "LASF_Spec" and vlr.record_id in record_ids
+
+
 def convert(source_las, *, point_format_id=None, file_version=None):
     """Converts a Las from one point format to another
     Automatically upgrades the file version if source file version is not compatible with
@@ -404,6 +415,30 @@ def convert(source_las, *, point_format_id=None, file_version=None):
         evlrs = VLRList(source_las.evlrs.copy())
     else:
         evlrs = None
+
+    if (
+        source_las.point_format.has_waveform_packet
+        and not point_format.has_waveform_packet
+    ):
+        # The wave packet dimensions are the only thing referencing the waveform
+        # records, so once they are gone the Waveform Packet Descriptor VLRs, the
+        # waveform data EVLR and the header fields pointing at them are dangling
+        # and make the file non conformant (point formats 4, 5, 9 and 10 are the
+        # only ones allowed to advertise waveforms). Drop them all.
+        header.vlrs = VLRList(
+            vlr
+            for vlr in header.vlrs
+            if not _is_waveform_vlr(vlr, WAVEFORM_DESCRIPTOR_IDS)
+        )
+        if evlrs is not None:
+            evlrs = VLRList(
+                evlr
+                for evlr in evlrs
+                if not _is_waveform_vlr(evlr, WAVEFORM_DATA_PACKET_IDS)
+            )
+        header.global_encoding.waveform_data_packets_internal = False
+        header.global_encoding.waveform_data_packets_external = False
+        header.start_of_waveform_data_packet_record = 0
 
     points = record.PackedPointRecord.from_point_record(
         source_las.points, header.point_format
